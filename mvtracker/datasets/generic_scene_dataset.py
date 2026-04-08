@@ -52,6 +52,9 @@ class GenericSceneDataset(Dataset):
             #   ], dtype=torch.float32)
 
             stream_viz_to_rerun=False,
+
+            target_size=392,
+            frames_chunk_size=1,
     ):
         self.dataset_dir = dataset_dir
 
@@ -84,6 +87,9 @@ class GenericSceneDataset(Dataset):
         self.scene_normalization_manual_translation = scene_normalization_manual_translation
 
         self.stream_viz_to_rerun = stream_viz_to_rerun
+
+        self.target_size = target_size
+        self.frames_chunk_size = frames_chunk_size
 
         self.seq_names = sorted([
             f.replace(".pkl", "")
@@ -166,6 +172,8 @@ class GenericSceneDataset(Dataset):
                 vggt_cache_subdir="vggt_cache",
                 skip_if_cached=self.skip_depth_computation_if_cached,
                 model_id="facebook/VGGT-1B",
+                target=self.target_size,
+                frames_chunk_size=self.frames_chunk_size,
             )
 
         elif self.use_vggt_depths_with_raw_cameras:
@@ -177,6 +185,8 @@ class GenericSceneDataset(Dataset):
                 vggt_cache_subdir="vggt_cache",
                 skip_if_cached=self.skip_depth_computation_if_cached,
                 model_id="facebook/VGGT-1B",
+                target=self.target_size,
+                frames_chunk_size=self.frames_chunk_size,
             )
 
         elif self.use_monofusion_depths:
@@ -611,6 +621,8 @@ def _ensure_vggt_raw_cache_and_load(
         vggt_cache_subdir: str = "vggt_cache",
         skip_if_cached: bool = True,
         model_id: str = "facebook/VGGT-1B",
+        target: int = 392,
+        frames_chunk_size: int = 1,
 ):
     """
     Run VGGT and cache RAW predictions (no alignment).
@@ -646,7 +658,7 @@ def _ensure_vggt_raw_cache_and_load(
     amp_dtype = torch.bfloat16 if (
             device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
 
-    def _compute_pad_to_518(H0: int, W0: int, target: int = 518) -> Tuple[int, int, int, int, int, int]:
+    def _compute_pad_to_target(H0: int, W0: int, target: int = 392) -> Tuple[int, int, int, int, int, int]:
         """
         Mirror VGGT's load_and_preprocess_images(mode='pad') padding math so we can undo it.
         Returns: new_h, new_w, pad_top, pad_bottom, pad_left, pad_right
@@ -677,21 +689,21 @@ def _ensure_vggt_raw_cache_and_load(
     with torch.no_grad(), torch.cuda.amp.autocast(enabled=(device.type == "cuda"), dtype=amp_dtype):
         for t in tqdm(range(T), desc=f"VGGT RAW {seq_name}", unit="f"):
             image_items = [rgbs[v, t].cpu() for v in range(V)]  # each: [3,H,W] uint8
-            images = _vggt_load_and_preprocess_images(image_items, mode="pad").to(device)[None]  # [1,V,3,518,518]
+            images = _vggt_load_and_preprocess_images(image_items, mode="pad", target=target).to(device)[None]  # [1,V,3,target,target]
 
             tokens, ps_idx = model.aggregator(images)
             pose_enc = model.camera_head(tokens)[-1]
             extr_pred, intr_pred = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])  # [1,V,3,4],[1,V,3,3]
-            depth_maps, _ = model.depth_head(tokens, images, ps_idx)  # [1,V,518,518]
+            depth_maps, _ = model.depth_head(tokens, images, ps_idx, frames_chunk_size=frames_chunk_size)  # [1,V,target,target]
 
             # per-view: undo pad, resize back to (H0,W0), adjust intrinsics
             d_full_list, K_list = [], []
             for v in range(V):
                 H0, W0 = int(rgbs[v, t].shape[-2]), int(rgbs[v, t].shape[-1])
-                new_h, new_w, pt, pb, pl, pr = _compute_pad_to_518(H0, W0)
+                new_h, new_w, pt, pb, pl, pr = _compute_pad_to_target(H0, W0, target)
 
-                # crop padding region out of the 518x518 depth
-                d_small = depth_maps[0, v:v + 1, pt:518 - pb, pl:518 - pr]  # [1,new_h,new_w]
+                # crop padding region out of the target x target depth
+                d_small = depth_maps[0, v:v + 1, pt:target - pb, pl:target - pr].cpu()  # [1,new_h,new_w]
                 d_full_v = F.interpolate(d_small[:, None, :, :, 0], size=(H0, W0), mode="nearest")[:, 0]  # [1,H0,W0]
                 d_full_list.append(d_full_v.squeeze(0))
 
@@ -717,7 +729,7 @@ def _ensure_vggt_raw_cache_and_load(
     return depths_raw_arr.unsqueeze(2), confs_arr.unsqueeze(2), intr_raw_arr, extr_raw_arr
 
 
-def _vggt_load_and_preprocess_images(image_items, mode="crop"):
+def _vggt_load_and_preprocess_images(image_items, mode="crop", target=392):
     """
     Same as VGGT loader, but accepts in-memory items as well.
     """
@@ -731,7 +743,7 @@ def _vggt_load_and_preprocess_images(image_items, mode="crop"):
     images = []
     shapes = set()
     to_tensor = TF.ToTensor()
-    target_size = 518
+    target_size = target
 
     def _to_pil(item):
         # path
@@ -859,6 +871,8 @@ def _ensure_vggt_aligned_cache_and_load(
         vggt_cache_subdir: str = "vggt_cache",
         skip_if_cached: bool = True,
         model_id: str = "facebook/VGGT-1B",
+        target: int = 392,
+        frames_chunk_size: int = 1,
 ):
     """
     Ensure RAW VGGT cache exists (running VGGT if needed), then align VGGT cameras to GT via
@@ -877,6 +891,8 @@ def _ensure_vggt_aligned_cache_and_load(
         vggt_cache_subdir=vggt_cache_subdir,
         skip_if_cached=skip_if_cached,
         model_id=model_id,
+        target=target,
+        frames_chunk_size=frames_chunk_size,
     )
 
     # 2) Aligned cache file paths

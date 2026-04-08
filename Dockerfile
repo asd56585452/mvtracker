@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
 
 # 3. 設定 GPU 編譯架構清單 (涵蓋 RTX 3060, 4090, 5070)
 ENV TORCH_CUDA_ARCH_LIST="8.6;8.9;12.0"
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 WORKDIR /workspace
 

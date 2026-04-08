@@ -11,8 +11,11 @@ from torchvision.transforms.functional import to_tensor
 # 匯入 MVTracker 內建的 VGGT 處理函式與 3D 轉換工具
 from mvtracker.datasets.generic_scene_dataset import _ensure_vggt_raw_cache_and_load
 from mvtracker.models.core.model_utils import init_pointcloud_from_rgbd
-
-def main(dataset_dir):
+print("PyTorch Version:", torch.__version__)
+print("CUDA Available:", torch.cuda.is_available())
+print("CUDA Version:", torch.version.cuda)
+print("FlashAttention Support:", hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
+def main(dataset_dir, target_size=392, frames_chunk_size=1):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     # 1. 抓取每個視角的第一幀 (00001.jpg)
@@ -40,7 +43,9 @@ def main(dataset_dir):
         dataset_root=dataset_dir,
         vggt_cache_subdir="vggt_cache",
         skip_if_cached=False,   # 強制重新執行提取
-        model_id="facebook/VGGT-1B"
+        model_id="facebook/VGGT-1B",
+        target=target_size,
+        frames_chunk_size=frames_chunk_size,
     )
 
     # 3. 生成 3D 點雲
@@ -171,6 +176,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", type=str, required=True, help="資料集路徑 (如 datasets/bullpen)")
+    parser.add_argument("--target_size", type=int, default=392, help="VGGT 輸入尺寸")
+    parser.add_argument("--frames_chunk_size", type=int, default=1, help="每批處理的幀數")
     args = parser.parse_args()
-    main(args.dir)
+    main(args.dir, args.target_size, args.frames_chunk_size)
 # python scripts/prepare_4dgs_vggt.py --dir datasets/bullpen
