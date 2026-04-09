@@ -3,6 +3,8 @@ services:
     image: mvtracker_env
     container_name: mvtracker_container
 
+    working_dir: /workspace/mvtracker
+
     # 對應 -it (讓你能在終端機裡互動)
     stdin_open: true
     tty: true
