@@ -1,0 +1,41 @@
+services:
+  mvtracker:
+    image: mvtracker_env
+    container_name: mvtracker_container
+
+    # 對應 -it (讓你能在終端機裡互動)
+    stdin_open: true
+    tty: true
+
+    # 對應 --ipc=host
+    ipc: host
+
+    # 對應 -p 9876:9876
+    ports:
+      - "9876:9876"
+
+    # 對應 -v 的掛載路徑
+    volumes:
+      - /home/tsaichenghan/.cache/huggingface:/root/.cache/huggingface
+      - /home/tsaichenghan/mvtracker:/workspace/mvtracker
+
+    # 【超級大禮包】直接幫你把預防 VRAM 碎片的環境變數寫死在這裡！
+    environment:
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+    # 對應 --ulimit 設定
+    ulimits:
+      memlock: -1
+      stack: 67108864
+
+    # 對應 --gpus all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+
+    # 對應最後的 /bin/bash
+    command: /bin/bash
