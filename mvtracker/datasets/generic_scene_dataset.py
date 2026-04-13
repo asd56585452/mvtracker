@@ -721,10 +721,10 @@ def _ensure_vggt_raw_cache_and_load(
             extr_raw_arr[:, t] = extr_pred[0].detach().cpu().float()  # raw VGGT w2c
 
     # save raw cache
-    np.save(f_depths_raw, depths_raw_arr.numpy())
-    np.save(f_confs, confs_arr.numpy())
-    np.save(f_intr_raw, intr_raw_arr.numpy())
-    np.save(f_extr_raw, extr_raw_arr.numpy())
+    # np.save(f_depths_raw, depths_raw_arr.numpy())
+    # np.save(f_confs, confs_arr.numpy())
+    # np.save(f_intr_raw, intr_raw_arr.numpy())
+    # np.save(f_extr_raw, extr_raw_arr.numpy())
 
     return depths_raw_arr.unsqueeze(2), confs_arr.unsqueeze(2), intr_raw_arr, extr_raw_arr
 

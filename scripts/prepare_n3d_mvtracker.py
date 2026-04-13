@@ -85,7 +85,7 @@ def main(dataset_dir, target_size=392, frames_chunk_size=1):
     # ==========================================
     # 2. 篩選相機並準備資料
     # ==========================================
-    SELECTED_CAMS = [0, 3, 6, 9, 12, 14, 17, 20]
+    SELECTED_CAMS = [0, 1,2,3, 4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]
     
     rgbs_list, extrs_list, intrs_list = [], [], []
     for cam_idx in SELECTED_CAMS:
