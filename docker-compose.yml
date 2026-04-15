@@ -12,13 +12,14 @@ services:
     # 對應 --ipc=host
     ipc: host
 
+    network_mode: host
     # 對應 -p 9876:9876
-    ports:
-      - "9876:9876"
+    # ports:
+    #   - "9876:9876"
 
     # 對應 -v 的掛載路徑
     volumes:
-      - /home/tsaichenghan/.cache/huggingface:/root/.cache/huggingface
+      - /home/tsaichenghan/.cache:/root/.cache
       - /home/tsaichenghan/mvtracker:/workspace/mvtracker
 
     # 【超級大禮包】直接幫你把預防 VRAM 碎片的環境變數寫死在這裡！

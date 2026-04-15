@@ -59,7 +59,7 @@ def log_pointclouds_to_rerun(
 ):
     # Set the up-axis for the world
     # Log coordinate axes for reference
-    rr.set_time_seconds("frame", 0)
+    rr.set_time("frame", duration=0)
     B, V, T, _, H, W = rgbs.shape
     assert rgbs.shape == (B, V, T, 3, H, W)
     assert depths.shape == (B, V, T, 1, H, W)
@@ -80,7 +80,7 @@ def log_pointclouds_to_rerun(
             if timesteps_to_log is not None and t not in timesteps_to_log:
                 continue
 
-            rr.set_time_seconds("frame", t / fps)
+            rr.set_time("frame", duration=t / fps)
 
             # Log RGB image
             rgb_image = rgbs[0, v, t].permute(1, 2, 0).cpu().numpy()
@@ -213,7 +213,7 @@ def _log_tracks_to_rerun(
             # if t not in [0] + [T * (x + 1) // 3 - 1 for x in range(3)]:
             # if t not in [T - 1]:
             #     continue
-            rr.set_time_seconds("frame", t / fps)
+            rr.set_time("frame", duration=t / fps)
 
             # Log the point (special handling for invisible points)
             if log_points:
@@ -300,7 +300,7 @@ def _log_tracks_to_rerun_lightweight(
     assert colors.shape == (N, 4)
 
     for t in range(T):
-        rr.set_time_seconds("frame", t / fps)
+        rr.set_time("frame", duration=t / fps)
         points_list, points_colors = [], []
         strips_list, strips_colors_list = [], []
         errors_list = []
