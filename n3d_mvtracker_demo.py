@@ -85,7 +85,7 @@ def main():
     all_w2c_np = np.stack(all_w2c)
     all_intrs_np = np.stack(all_intrs)
 
-    SELECTED_CAMS = [1,3, 6, 9, 12, 15, 18, 20]
+    SELECTED_CAMS = [1, 6,  12,  18, 20]
     V = len(SELECTED_CAMS)
     
     # 建構 Extrinsics 與 Intrinsics，維度擴展為 [V, T, ...]
@@ -133,8 +133,6 @@ def main():
                 vggt_cache_subdir="vggt_cache",
                 skip_if_cached=False,
                 model_id="facebook/VGGT-1B",
-                target=args.vggt_target_size,
-                frames_chunk_size=1,
             )
     else:
         print("🚀 提取 VGGT Raw 深度並套用至 GT 外參...")
@@ -146,8 +144,6 @@ def main():
                 vggt_cache_subdir="vggt_cache",
                 skip_if_cached=False,
                 model_id="facebook/VGGT-1B",
-                target=args.vggt_target_size,
-                frames_chunk_size=1,
             )
         
         def get_centers(w2c_tensor):
