@@ -104,54 +104,66 @@ def main(dataset_dir, target_size=392, frames_chunk_size=1, frame_step=2):
     all_pts, all_colors, all_times = [], [], []
 
     # ==========================================
-    # 3. 逐幀提取 (加入跳幀邏輯)
+    # 3. 提取 (跳幀邏輯 + 一口氣生成)
     # ==========================================
-    print(f"🚀 開始提取 4D 初始點雲 (每 {frame_step} 幀取樣一次)...")
-    
-    # 👇 修改這裡的迴圈，加入 frame_step 作為 step 參數
-    for t in tqdm(range(0, num_frames, frame_step), desc="4D 點雲生成進度"):
-        t0 = time.time()
-        
-        rgbs_list = []
-        for cam_idx in SELECTED_CAMS:
-            frames = sorted(glob.glob(os.path.join(view_dirs[cam_idx], '*.jpg')))
+    time_indices = list(range(0, num_frames, frame_step))
+    print(f"🚀 開始提取 4D 初始點雲 (共 {len(time_indices)} 幀)...")
+
+    rgbs_list = []
+    for cam_idx in tqdm(SELECTED_CAMS, desc="讀取影像"):
+        frames = sorted(glob.glob(os.path.join(view_dirs[cam_idx], '*.jpg')))
+        cam_rgbs = []
+        for t in time_indices:
             img = Image.open(frames[t]).convert('RGB')
             img_resized = img.resize((TARGET_W, TARGET_H), Image.Resampling.BILINEAR)
-            rgbs_list.append((to_tensor(img_resized) * 255).byte()) # [3, H, W] uint8
-        
-        rgbs = torch.stack(rgbs_list).unsqueeze(1) 
-        V, T_vggt, C, H, W = rgbs.shape
-        t1 = time.time()
-        
-        with torch.no_grad():
-            depths_raw, _, _, extrs_vggt = _ensure_vggt_raw_cache_and_load(
-                rgbs=rgbs, 
-                seq_name=f"n3d_gt_init_f{t:04d}", 
-                dataset_root=dataset_dir,
-                vggt_cache_subdir="vggt_cache", 
-                skip_if_cached=False, 
-                model_id="facebook/VGGT-1B", 
-                target=target_size, 
-                frames_chunk_size=frames_chunk_size,
-            )
-        t2 = time.time()
+            cam_rgbs.append((to_tensor(img_resized) * 255).byte()) # [3, H, W] uint8
+        rgbs_list.append(torch.stack(cam_rgbs)) # [T, 3, H, W]
+    
+    rgbs_tensor = torch.stack(rgbs_list) # [V, T, 3, H, W]
 
-        vggt_centers = get_centers(extrs_vggt[:, 0].to(device))
-        scale_factor = (torch.pdist(gt_centers).mean() / torch.pdist(vggt_centers).mean()).item()
-        depths_metric = depths_raw.to(device) * scale_factor
-
-        xyz, rgb = init_pointcloud_from_rgbd(
-            fmaps=rgbs.to(device).unsqueeze(0).float(), 
-            depths=depths_metric.unsqueeze(0),
-            intrs=intrs_gt.unsqueeze(0),
-            extrs=extrs_gt.unsqueeze(0),
-            stride=1, 
-            level=0
+    print("🚀 進行 VGGT 推論...")
+    t1 = time.time()
+    with torch.no_grad():
+        depths_raw, _, _, extrs_vggt = _ensure_vggt_raw_cache_and_load(
+            rgbs=rgbs_tensor, 
+            seq_name="n3d_gt_init_4d", 
+            dataset_root=dataset_dir,
+            vggt_cache_subdir="vggt_cache", 
+            skip_if_cached=False, 
+            model_id="facebook/VGGT-1B", 
         )
-        t3 = time.time()
-        
-        pts, colors = xyz[0].cpu().numpy(), rgb[0].cpu().numpy()
-        depths_flat = depths_metric[:, 0, 0].flatten().cpu().numpy()
+    t2 = time.time()
+
+    depths_metric = depths_raw.to(device).clone() # [V, T, 1, H, W]
+    for idx_t, real_t in enumerate(time_indices):
+        vggt_centers = get_centers(extrs_vggt[:, idx_t].to(device))
+        gt_cent = get_centers(extrs_gt[:, 0].to(device)) 
+        scale_factor = (torch.pdist(gt_cent).mean() / (torch.pdist(vggt_centers).mean() + 1e-8)).item()
+        depths_metric[:, idx_t] *= scale_factor
+
+    extrs_gt_exp = extrs_gt.expand(-1, len(time_indices), -1, -1) # [V, T, 3, 4]
+    intrs_gt_exp = intrs_gt.expand(-1, len(time_indices), -1, -1) # [V, T, 3, 3]
+
+    print("🚀 呼叫 init_pointcloud_from_rgbd 一口氣轉換所有點雲...")
+    torch.cuda.empty_cache()
+    xyz, rgb = init_pointcloud_from_rgbd(
+        fmaps=rgbs_tensor.to(device).unsqueeze(0).float(), # [1, V, T, 3, H, W]
+        depths=depths_metric.unsqueeze(0),                 # [1, V, T, 1, H, W]
+        intrs=intrs_gt_exp.to(device).unsqueeze(0),        # [1, V, T, 3, 3]
+        extrs=extrs_gt_exp.to(device).unsqueeze(0),        # [1, V, T, 3, 4]
+        stride=1, 
+        level=0
+    )
+    t3 = time.time()
+    print(f" VGGT 耗時: {t2-t1:.2f}s, 點雲轉換耗時: {t3-t2:.2f}s")
+    
+    total_processed_frames = len(time_indices)
+    target_pts_per_frame = 200000 // total_processed_frames
+    
+    print("🚀 分幀取樣點雲...")
+    for idx_t, real_t in enumerate(time_indices):
+        pts, colors = xyz[idx_t].cpu().numpy(), rgb[idx_t].cpu().numpy()
+        depths_flat = depths_metric[:, idx_t, 0].flatten().cpu().numpy()
         
         valid_mask = depths_flat > 0
         pts_clean, colors_clean = pts[valid_mask], colors[valid_mask]
@@ -159,37 +171,18 @@ def main(dataset_dir, target_size=392, frames_chunk_size=1, frame_step=2):
         if colors_clean.max() <= 1.0: 
             colors_clean = (colors_clean * 255).astype(np.uint8)
 
-        # ==========================================
-        # 💡 救命優化 1：單幀立刻降採樣 (不要等最後才做)
-        # ==========================================
-        # 計算這一幀應該要貢獻多少點 (總共 20 萬點 / 總處理幀數)
-        total_processed_frames = len(range(0, num_frames, frame_step))
-        target_pts_per_frame = 200000 // total_processed_frames
-        
         if len(pts_clean) > target_pts_per_frame:
             indices = np.random.choice(len(pts_clean), target_pts_per_frame, replace=False)
             pts_clean = pts_clean[indices]
             colors_clean = colors_clean[indices]
 
-        # 現在塞進陣列的點數已經非常少了，RAM 絕對不會爆
         all_pts.append(pts_clean)
         all_colors.append(colors_clean)
-        all_times.append(np.full((len(pts_clean), 1), t, dtype=np.float32))
+        all_times.append(np.full((len(pts_clean), 1), real_t, dtype=np.float32))
 
-        t4 = time.time()
-        print(f"\n[Frame {t}] 總耗時:{t4-t0:.2f}s (VGGT:{t2-t1:.2f}s)")
-
-        # ==========================================
-        # 💡 救命優化 2：殘酷無情的強制記憶體回收
-        # ==========================================
-        # 刪除這回合佔用空間的巨大 Tensor 與變數
-        del rgbs, depths_raw, extrs_vggt, depths_metric, xyz, rgb, pts, colors, valid_mask
-        
-        # 強制 PyTorch 清空 VRAM 快取
-        torch.cuda.empty_cache()
-        
-        # 強制 Python 清空 RAM 垃圾
-        gc.collect()
+    del rgbs_tensor, depths_raw, extrs_vggt, depths_metric, xyz, rgb
+    torch.cuda.empty_cache()
+    gc.collect()
 
     # ==========================================
     # 4. 全域降採樣與匯出

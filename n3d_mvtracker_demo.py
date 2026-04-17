@@ -47,7 +47,7 @@ def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dir", type=str, required=True, help="n3d 資料集路徑")
-    p.add_argument("--max_frames", type=int, default=15, help="限制載入的最大幀數 (避免 MVTracker OOM)")
+    p.add_argument("--max_frames", type=int, default=30, help="限制載入的最大幀數 (避免 MVTracker OOM)")
     p.add_argument("--num_queries", type=int, default=512, help="要追蹤的點數量")
     p.add_argument("--vggt_target_size", type=int, default=392, help="VGGT 解析度")
     p.add_argument("--use_vggt_cameras", action="store_true", help="使用 VGGT 預測的內外參，並以 aligned 載入；若不加此參數則使用 GT 內外參搭配 raw 深度")
@@ -85,7 +85,7 @@ def main():
     all_w2c_np = np.stack(all_w2c)
     all_intrs_np = np.stack(all_intrs)
 
-    SELECTED_CAMS = [1, 6,  12,  18, 20]
+    SELECTED_CAMS = [1, 10, 13, 16, 18]
     V = len(SELECTED_CAMS)
     
     # 建構 Extrinsics 與 Intrinsics，維度擴展為 [V, T, ...]
@@ -168,15 +168,15 @@ def main():
     print(f"🎯 從 t=0 幀深度圖取樣 {args.num_queries} 個追蹤點...")
     t0 = 0
     xyz, _ = init_pointcloud_from_rgbd(
-        fmaps=rgbs_tensor[:, t0:t0+1].unsqueeze(0).float(),
-        depths=depths_tensor[:, t0:t0+1].unsqueeze(0),
-        intrs=intrs_model[:, t0:t0+1].unsqueeze(0),
-        extrs=extrs_model[:, t0:t0+1].unsqueeze(0),
+        fmaps=rgbs_tensor[0:1, t0:t0+1].unsqueeze(0).float(),
+        depths=depths_tensor[0:1, t0:t0+1].unsqueeze(0),
+        intrs=intrs_model[0:1, t0:t0+1].unsqueeze(0),
+        extrs=extrs_model[0:1, t0:t0+1].unsqueeze(0),
         stride=1,
         level=0,
     )
     pts = xyz[t0]  # [V*H*W, 3] at t=0
-    valid_mask = depths_tensor[:, t0, 0].flatten() > 0
+    valid_mask = depths_tensor[0:1, t0, 0].flatten() > 0
     pool = pts[valid_mask]
     
     assert pool.shape[0] > 0, "沒有找到有效的深度點來產生 Queries！"
@@ -193,7 +193,6 @@ def main():
     mvtracker = torch.hub.load("ethz-vlg/mvtracker", "mvtracker", pretrained=True, device=device)
     
     torch.set_float32_matmul_precision("high")
-    # RTX 6000 Ada (Capability 8.9) 支援 bfloat16
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
     
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
@@ -255,9 +254,9 @@ def main():
         pred_visibilities=pred_vis,
         per_track_results=None,
         radii_scale=1.0,
-        fps=12,
-        sphere_radius_crop=12.0,
-        sphere_center_crop=np.array([0, 0, 0]),
+        fps=30,
+        sphere_radius_crop=None,
+        sphere_center_crop=scene_center,
         log_per_interval_results=False,
         max_tracks_to_log=100 if args.lightweight else None,
         track_batch_size=50,
