@@ -81,10 +81,16 @@ def main(dataset_dir, target_size=392, frames_chunk_size=1, frame_step=2):
     # 2. 手動篩選相機
     # ==========================================
     SELECTED_CAMS = [1,6,10,14,20]
+    TARGET_W, TARGET_H = 768, 576
+    scale_x = TARGET_W / W_img
+    scale_y = TARGET_H / H_img
     extrs_list, intrs_list = [], []
     for cam_idx in SELECTED_CAMS:
         extrs_list.append(torch.from_numpy(all_w2c_np[cam_idx]).float())
-        intrs_list.append(torch.from_numpy(all_intrs_np[cam_idx]).float())
+        K_original = all_intrs_np[cam_idx].copy()
+        K_original[0, :] *= scale_x  # 縮放 fx, cx
+        K_original[1, :] *= scale_y  # 縮放 fy, cy
+        intrs_list.append(torch.from_numpy(K_original).float())
         
     extrs_gt = torch.stack(extrs_list).unsqueeze(1).to(device) 
     intrs_gt = torch.stack(intrs_list).unsqueeze(1).to(device) 
@@ -110,7 +116,8 @@ def main(dataset_dir, target_size=392, frames_chunk_size=1, frame_step=2):
         for cam_idx in SELECTED_CAMS:
             frames = sorted(glob.glob(os.path.join(view_dirs[cam_idx], '*.jpg')))
             img = Image.open(frames[t]).convert('RGB')
-            rgbs_list.append((to_tensor(img) * 255).byte())
+            img_resized = img.resize((TARGET_W, TARGET_H), Image.Resampling.BILINEAR)
+            rgbs_list.append((to_tensor(img_resized) * 255).byte()) # [3, H, W] uint8
         
         rgbs = torch.stack(rgbs_list).unsqueeze(1) 
         V, T_vggt, C, H, W = rgbs.shape

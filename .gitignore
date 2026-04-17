@@ -18,3 +18,4 @@ logs*
 /eular_log
 /outputs
 /wandb
+*.rrd

@@ -703,7 +703,7 @@ def _ensure_vggt_raw_cache_and_load(
                 new_h, new_w, pt, pb, pl, pr = _compute_pad_to_target(H0, W0, target)
 
                 # crop padding region out of the target x target depth
-                d_small = depth_maps[0, v:v + 1, pt:target - pb, pl:target - pr].cpu()  # [1,new_h,new_w]
+                d_small = depth_maps[0, v:v + 1, pt:target - pb, pl:target - pr]  # [1,new_h,new_w]
                 d_full_v = F.interpolate(d_small[:, None, :, :, 0], size=(H0, W0), mode="nearest")[:, 0]  # [1,H0,W0]
                 d_full_list.append(d_full_v.squeeze(0))
 
