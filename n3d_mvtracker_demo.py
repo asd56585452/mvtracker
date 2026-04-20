@@ -47,9 +47,8 @@ def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dir", type=str, required=True, help="n3d 資料集路徑")
-    p.add_argument("--max_frames", type=int, default=30, help="限制載入的最大幀數 (避免 MVTracker OOM)")
+    p.add_argument("--max_frames", type=int, default=100, help="限制載入的最大幀數 (避免 MVTracker OOM)")
     p.add_argument("--num_queries", type=int, default=512, help="要追蹤的點數量")
-    p.add_argument("--vggt_target_size", type=int, default=392, help="VGGT 解析度")
     p.add_argument("--use_vggt_cameras", action="store_true", help="使用 VGGT 預測的內外參，並以 aligned 載入；若不加此參數則使用 GT 內外參搭配 raw 深度")
     p.add_argument("--rerun", choices=["save", "spawn", "stream"], default="save")
     p.add_argument("--lightweight", action="store_true", help="使用輕量級視覺化 (適合網頁版 Viewer)")
@@ -190,7 +189,7 @@ def main():
     # 4. 載入並執行 MVTracker
     # ==========================================
     print("🧠 載入 MVTracker 並開始追蹤...")
-    mvtracker = torch.hub.load("ethz-vlg/mvtracker", "mvtracker", pretrained=True, device=device)
+    mvtracker = torch.hub.load(".", "mvtracker", source="local", pretrained=True, device=device)
     
     torch.set_float32_matmul_precision("high")
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
@@ -198,8 +197,8 @@ def main():
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
         # 這裡需要加上 [None] batch 維度，並把 RGB 縮放到 0~1
         results = mvtracker(
-            rgbs=rgbs_tensor[None].to(device) / 255.0,
-            depths=depths_tensor[None].to(device),
+            rgbs=rgbs_tensor[None].cpu() / 255.0,
+            depths=depths_tensor[None].cpu(),
             intrs=intrs_model[None].to(device),
             extrs=extrs_model[None].to(device),
             query_points_3d=query_points[None].to(device),

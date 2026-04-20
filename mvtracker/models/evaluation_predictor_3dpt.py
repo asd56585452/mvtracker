@@ -96,7 +96,7 @@ class EvaluationPredictor(torch.nn.Module):
         extrs_square[:, :, :, :3, :] = extrs
         extrs_inv = torch.inverse(extrs_square.float()).type(extrs.dtype)
 
-        support_points = torch.zeros((batch_size, 0, 4), device=rgbs.device)
+        support_points = torch.zeros((batch_size, 0, 4), device=intrs.device)
 
         grid_points = []
         if self.grid_size > 0:
@@ -109,6 +109,8 @@ class EvaluationPredictor(torch.nn.Module):
                         pixel_xy[..., 0],
                         pixel_xy[..., 1],
                     ).permute(0, 2, 1)
+                    camera_z = camera_z.to(intrs.device)
+                    pixel_xy_homo = pixel_xy_homo.to(intrs.device)
                     camera_xyz = torch.einsum('Bij,BNj->BNi', intrs_inv[:, view_idx, t, :, :], pixel_xy_homo)
                     camera_xyz = camera_xyz * camera_z
                     camera_xyz_homo = to_homogeneous(camera_xyz)
@@ -211,16 +213,16 @@ class EvaluationPredictor(torch.nn.Module):
             ]
             query_points_perview_camera_z = query_points_perview_camera_xyz[..., -1:]
 
-            traj_e = torch.zeros((batch_size, num_frames, num_points, 3), device=rgbs.device)
-            vis_e = torch.zeros((batch_size, num_frames, num_points), device=rgbs.device)
+            traj_e = torch.zeros((batch_size, num_frames, num_points, 3), device=intrs.device)
+            vis_e = torch.zeros((batch_size, num_frames, num_points), device=intrs.device)
             for point_idx in tqdm(range(num_points), desc="Single point evaluation"):
                 # Support points for this query point
-                support_points_i = torch.zeros((batch_size, 0, 4), device=rgbs.device)
+                support_points_i = torch.zeros((batch_size, 0, 4), device=intrs.device)
 
                 # Add the local support points
                 if self.local_grid_size > 0:
                     t = query_points_t[0, point_idx, 0].item()
-                    local_grid_points = torch.zeros((batch_size, 0, 4), device=rgbs.device)
+                    local_grid_points = torch.zeros((batch_size, 0, 4), device=intrs.device)
                     for view_idx in range(num_views):
                         pixel_xy = get_points_on_a_grid(
                             size=self.local_grid_size,
@@ -242,6 +244,8 @@ class EvaluationPredictor(torch.nn.Module):
                             pixel_xy[..., 0],
                             pixel_xy[..., 1],
                         ).permute(0, 2, 1)
+                        camera_z = camera_z.to(intrs.device)
+                        pixel_xy_homo = pixel_xy_homo.to(intrs.device)
                         camera_xyz = torch.einsum('Bij,BNj->BNi', intrs_inv[:, view_idx, t, :, :], pixel_xy_homo)
                         camera_xyz = camera_xyz * camera_z
                         camera_xyz_homo = to_homogeneous(camera_xyz)
