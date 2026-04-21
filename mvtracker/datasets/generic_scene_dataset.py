@@ -915,13 +915,31 @@ def _ensure_vggt_aligned_cache_and_load(
             _camera_center_from_affine_extr(gt_w2c),
             _camera_center_from_affine_extr(pred_w2c),
         )
-        pred_w2c_aligned = apply_sim3_to_extrinsics(pred_w2c, s, R_align, t_align)
 
+        # 轉換為純剛體相機矩陣 (Rigid Extrinsics)，不把 Scale 塞進旋轉矩陣裡
+        pred_w2c_aligned = []
+        for extr in pred_w2c:
+            R_old = extr[:3, :3]
+            t_old = extr[:3, 3]
+            
+            # 純旋轉矩陣 (行列式必為 1)
+            R_new = R_old @ R_align.T
+            # 純平移向量 (結合了 Scale 放大，確保相機位移正確)
+            t_new = s * t_old - R_new @ t_align
+            
+            extr_new = np.zeros((3, 4), dtype=np.float32)
+            extr_new[:, :3] = R_new
+            extr_new[:, 3] = t_new
+            pred_w2c_aligned.append(extr_new)
+            
         extr_aln[:, t] = torch.from_numpy(np.array(pred_w2c_aligned)).float()
+        
+        # 將被從外參剝奪的 scale 乘回對應的深度圖上
+        depths_aln[:, t] = depths_aln[:, t] * float(s)
 
     # 5) Save aligned cache
-    np.save(f_depths_aln, depths_aln.numpy())
-    np.save(f_intr_aln, intr_aln.numpy())
-    np.save(f_extr_aln, extr_aln.numpy())
+    # np.save(f_depths_aln, depths_aln.numpy())
+    # np.save(f_intr_aln, intr_aln.numpy())
+    # np.save(f_extr_aln, extr_aln.numpy())
 
     return depths_aln.unsqueeze(2), confs_raw, intr_aln, extr_aln

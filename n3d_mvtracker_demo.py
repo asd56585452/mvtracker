@@ -47,9 +47,10 @@ def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dir", type=str, required=True, help="n3d 資料集路徑")
-    p.add_argument("--max_frames", type=int, default=100, help="限制載入的最大幀數 (避免 MVTracker OOM)")
+    p.add_argument("--max_frames", type=int, default=300, help="限制載入的最大幀數 (避免 MVTracker OOM)")
     p.add_argument("--num_queries", type=int, default=512, help="要追蹤的點數量")
     p.add_argument("--use_vggt_cameras", action="store_true", help="使用 VGGT 預測的內外參，並以 aligned 載入；若不加此參數則使用 GT 內外參搭配 raw 深度")
+    p.add_argument("--mask_img", type=str, default="mask.jpg", help="提供白色像素標註追蹤點的遮罩圖片路徑 (例如: mask.png)")
     p.add_argument("--rerun", choices=["save", "spawn", "stream"], default="save")
     p.add_argument("--lightweight", action="store_true", help="使用輕量級視覺化 (適合網頁版 Viewer)")
     p.add_argument("--rrd", default="n3d_mvtracker_demo.rrd", help="輸出的 Rerun 檔名")
@@ -134,32 +135,20 @@ def main():
                 model_id="facebook/VGGT-1B",
             )
     else:
-        print("🚀 提取 VGGT Raw 深度並套用至 GT 外參...")
+        print("🚀 提取 VGGT Raw 深度並套用至 GT 外參... Fail Now")
         with torch.no_grad():
-            depths_raw, _, _, extrs_vggt_raw = _ensure_vggt_raw_cache_and_load(
+            depths_tensor, _, intrs_vggt, extrs_vggt = _ensure_vggt_aligned_cache_and_load(
                 rgbs=rgbs_tensor,
                 seq_name="n3d_gt_init_raw",
                 dataset_root=args.dir,
+                extrs_gt=extrs_gt,
                 vggt_cache_subdir="vggt_cache",
                 skip_if_cached=False,
                 model_id="facebook/VGGT-1B",
             )
-        
-        def get_centers(w2c_tensor):
-            homo = torch.tensor([[[0,0,0,1]]]).expand(w2c_tensor.shape[0], -1, -1).to(w2c_tensor.device)
-            c2w = torch.inverse(torch.cat([w2c_tensor, homo], dim=1))
-            return c2w[:, :3, 3]
 
-        depths_tensor = depths_raw.clone() # already [V, T, 1, H, W]
-        
-        for t in range(num_frames):
-            gt_centers = get_centers(extrs_gt[:, t].to(device))
-            vggt_centers = get_centers(extrs_vggt_raw[:, t].to(device))
-            scale_factor = (torch.pdist(gt_centers).mean() / (torch.pdist(vggt_centers).mean() + 1e-8)).item()
-            depths_tensor[:, t] *= scale_factor
-
-        intrs_model = intrs_gt
-        extrs_model = extrs_gt
+        intrs_model = intrs_vggt
+        extrs_model = extrs_vggt
 
     # ==========================================
     # 3. 生成隨機 Query Points (於 t=0)
@@ -174,13 +163,46 @@ def main():
         stride=1,
         level=0,
     )
-    pts = xyz[t0]  # [V*H*W, 3] at t=0
-    valid_mask = depths_tensor[0:1, t0, 0].flatten() > 0
-    pool = pts[valid_mask]
+    pts = xyz[t0]  # [H*W, 3] at t=0
     
-    assert pool.shape[0] > 0, "沒有找到有效的深度點來產生 Queries！"
-    idx = torch.randperm(pool.shape[0])[:args.num_queries]
-    pts_sampled = pool[idx]
+    if args.mask_img and os.path.exists(args.mask_img):
+        print(f"🖼️ 讀取選點遮罩: {args.mask_img}")
+        mask_pil = Image.open(args.mask_img).convert('L')
+        # 縮放到與追蹤時相同的解析度
+        mask_resized = mask_pil.resize((TARGET_W, TARGET_H), Image.Resampling.BILINEAR)
+        mask_np = np.array(mask_resized)
+        
+        # 找到圖中帶有白色標註的地方 (亮度大於 200)
+        ys, xs = np.where(mask_np > 200)
+        
+        indices = []
+        for y, x in zip(ys, xs):
+            indices.append(y * TARGET_W + x)
+            
+        if len(indices) == 0:
+            print("⚠️ 遮罩中未找到明顯的白色像素標註，將改回隨機取樣。")
+            valid_mask = depths_tensor[0:1, t0, 0].flatten() > 0
+            pool = pts[valid_mask]
+            pts_sampled = pool[torch.randperm(pool.shape[0])[:args.num_queries]]
+        else:
+            # 去除重複點並直接取樣，也可以視情況做抽樣控制點數
+            indices = list(set(indices))
+            pool = pts[indices]
+            
+            # 若標註的數量超過設定的查詢數量上限，做隨機降採樣
+            if pool.shape[0] > args.num_queries:
+                idx = torch.randperm(pool.shape[0])[:args.num_queries]
+                pts_sampled = pool[idx]
+            else:
+                pts_sampled = pool
+                
+            print(f"✅ 成功從圖片中讀取 {len(pts_sampled)} 個手動標註點！")
+    else:
+        valid_mask = depths_tensor[0:1, t0, 0].flatten() > 0
+        pool = pts[valid_mask]
+        assert pool.shape[0] > 0, "沒有找到有效的深度點來產生 Queries！"
+        idx = torch.randperm(pool.shape[0])[:args.num_queries]
+        pts_sampled = pool[idx]
     
     ts = torch.full((pts_sampled.shape[0], 1), float(t0), device=pts_sampled.device)
     query_points = torch.cat([ts, pts_sampled], dim=1).float()  # (N,4): (t,x,y,z)
