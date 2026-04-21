@@ -71,11 +71,19 @@ class EvaluationPredictor(torch.nn.Module):
         # Interpolate the inputs to the desired resolution, if needed
         if self.interp_shape is None:
             height, width = height_raw, width_raw
+            if rgbs.dtype == torch.uint8:
+                rgbs = rgbs.float() / 255.0
         else:
             height, width = self.interp_shape
             rgbs = rgbs.reshape(-1, 3, height_raw, width_raw)
-            rgbs = F.interpolate(rgbs, (height, width), mode="nearest")
+            # Memory optimization: if uint8, interpolate as uint8 then convert
+            if rgbs.dtype == torch.uint8:
+                # 這樣就不會發生 full resolution 的 8GB float32 spike
+                rgbs = F.interpolate(rgbs, (height, width), mode="nearest").float() / 255.0
+            else:
+                rgbs = F.interpolate(rgbs, (height, width), mode="nearest")
             rgbs = rgbs.reshape(batch_size, num_views, num_frames, 3, height, width)
+            
             depths = depths.reshape(-1, 1, height_raw, width_raw)
             depths = F.interpolate(depths, (height, width), mode="nearest")
             depths = depths.reshape(batch_size, num_views, num_frames, 1, height, width)

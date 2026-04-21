@@ -219,7 +219,7 @@ def main():
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
         # 這裡需要加上 [None] batch 維度，並把 RGB 縮放到 0~1
         results = mvtracker(
-            rgbs=rgbs_tensor[None].cpu() / 255.0,
+            rgbs=rgbs_tensor[None].cpu(), # 直接傳遞 uint8 給 predictor 內部，省下大量記憶體
             depths=depths_tensor[None].cpu(),
             intrs=intrs_model[None].to(device),
             extrs=extrs_model[None].to(device),
