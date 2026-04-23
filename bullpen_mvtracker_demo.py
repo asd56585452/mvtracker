@@ -1,5 +1,6 @@
 import argparse
 import os
+import cv2
 import re
 import time
 import warnings
@@ -17,45 +18,16 @@ from mvtracker.models.core.model_utils import init_pointcloud_from_rgbd
 from mvtracker.utils.visualizer_rerun import log_pointclouds_to_rerun, log_tracks_to_rerun
 
 
-def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
-    """將 LLFF 轉換為 OpenCV，並進行解析度焦距自適應縮放"""
-    H_bound, W_bound, f_bound = pose_llff[:, 4]
-    scale_x = actual_W / W_bound
-    scale_y = actual_H / H_bound
-    
-    K = np.array([
-        [f_bound * scale_x, 0, actual_W / 2.0],
-        [0, f_bound * scale_y, actual_H / 2.0],
-        [0, 0, 1]
-    ], dtype=np.float32)
-
-    R_llff = pose_llff[:, :3]
-    t_llff = pose_llff[:, 3]
-
-    R_cv = np.zeros_like(R_llff)
-    R_cv[:, 0] = R_llff[:, 1]
-    R_cv[:, 1] = R_llff[:, 0]
-    R_cv[:, 2] = -R_llff[:, 2]
-
-    c2w_cv = np.eye(4, dtype=np.float32)
-    c2w_cv[:3, :3] = R_cv
-    c2w_cv[:3, 3] = t_llff
-
-    w2c_cv = np.linalg.inv(c2w_cv)[:3, :4]
-    return w2c_cv, K
-
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--dir", type=str, required=True, help="n3d 資料集路徑")
+    p.add_argument("--dir", type=str, required=True, help="bullpen 資料集路徑")
     p.add_argument("--max_frames", type=int, default=300, help="限制載入的最大幀數 (避免 MVTracker OOM)")
     p.add_argument("--num_queries", type=int, default=512, help="要追蹤的點數量")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
     p.add_argument("--mask_img", type=str, default="mask.jpg", help="提供白色像素標註追蹤點的遮罩圖片路徑 (例如: mask.png)")
-    p.add_argument("--mode", type=str, choices=["viz", "full", "both"], default="viz", help="運行模式: viz(視覺化), full(抽20萬點測速), both(測速並隨機抽樣視覺化)")
-    p.add_argument("--full_num_queries", type=int, default=200000, help="正式測試模式要追蹤的總點數量")
     p.add_argument("--rerun", choices=["save", "spawn", "stream"], default="save")
     p.add_argument("--lightweight", action="store_true", help="使用輕量級視覺化 (適合網頁版 Viewer)")
-    p.add_argument("--rrd", default="n3d_mvtracker_demo.rrd", help="輸出的 Rerun 檔名")
+    p.add_argument("--rrd", default="bullpen_mvtracker_demo.rrd", help="輸出的 Rerun 檔名")
     args = p.parse_args()
 
     np.random.seed(72)
@@ -75,32 +47,40 @@ def main():
     W_img, H_img = sample_img.size
     print(f"📷 處理圖片: {W_img}x{H_img} | 取樣幀數: {num_frames} 幀")
 
-    poses_path = os.path.join(args.dir, 'poses_bounds.npy')
-    poses_bounds = np.load(poses_path)
-    all_poses_llff = poses_bounds[:, :-2].reshape([-1, 3, 5])
+    intri_path = os.path.join(args.dir, "intri.yml")
+    extri_path = os.path.join(args.dir, "extri.yml")
     
-    all_w2c, all_intrs = [], []
-    for i in range(len(all_poses_llff)):
-        w2c, K = llff_to_opencv_w2c(all_poses_llff[i], W_img, H_img)
-        all_w2c.append(w2c)
-        all_intrs.append(K)
-    all_w2c_np = np.stack(all_w2c)
-    all_intrs_np = np.stack(all_intrs)
-
-    SELECTED_CAMS = [16, 10, 13, 1, 18]
+    intri_fs = cv2.FileStorage(intri_path, cv2.FILE_STORAGE_READ)
+    extri_fs = cv2.FileStorage(extri_path, cv2.FILE_STORAGE_READ)
+    
+    SELECTED_CAMS = [0, 1, 2, 3] # view_0 to view_3 correspond to cam1 to cam4
     V = len(SELECTED_CAMS)
+    cam_names = [f"cam{i+1}" for i in SELECTED_CAMS]
     
-    # 建構 Extrinsics 與 Intrinsics，維度擴展為 [V, T, ...]
     TARGET_W, TARGET_H = 768, 576
-    scale_x = TARGET_W / W_img
-    scale_y = TARGET_H / H_img
+    
     extrs_list, intrs_list = [], []
-    for cam_idx in SELECTED_CAMS:
-        extrs_list.append(torch.from_numpy(all_w2c_np[cam_idx]).float())
-        K_original = all_intrs_np[cam_idx].copy()
-        K_original[0, :] *= scale_x  # 縮放 fx, cx
-        K_original[1, :] *= scale_y  # 縮放 fy, cy
+    for cam in cam_names:
+        intr = intri_fs.getNode(f"K_{cam}").mat().astype(np.float32)
+        R = extri_fs.getNode(f"Rot_{cam}").mat().astype(np.float32)
+        T = extri_fs.getNode(f"T_{cam}").mat().astype(np.float32).reshape(3)
+        w2c = np.concatenate([R, T[:, None]], axis=1)
+        
+        orig_W = intr[0, 2] * 2
+        orig_H = intr[1, 2] * 2
+        
+        scale_x = TARGET_W / orig_W
+        scale_y = TARGET_H / orig_H
+        
+        K_original = intr.copy()
+        K_original[0, :] *= scale_x
+        K_original[1, :] *= scale_y
+        
+        extrs_list.append(torch.from_numpy(w2c).float())
         intrs_list.append(torch.from_numpy(K_original).float())
+        
+    intri_fs.release()
+    extri_fs.release()
         
     # extrs_gt shape: [V, T, 3, 4]
     extrs_gt = torch.stack(extrs_list).unsqueeze(1).repeat(1, num_frames, 1, 1)
@@ -129,7 +109,7 @@ def main():
         with torch.no_grad():
             depths_tensor, _, intrs_model, extrs_model = _ensure_vggt_aligned_cache_and_load(
                 rgbs=rgbs_tensor,
-                seq_name="n3d_gt_init_aligned",
+                seq_name="bullpen_gt_init_aligned",
                 dataset_root=args.dir,
                 extrs_gt=extrs_gt,
                 vggt_cache_subdir="vggt_cache",
@@ -141,7 +121,7 @@ def main():
         with torch.no_grad():
             depths_tensor, _, intrs_vggt, extrs_vggt = _ensure_vggt_aligned_cache_and_load(
                 rgbs=rgbs_tensor,
-                seq_name="n3d_gt_init_raw",
+                seq_name="bullpen_gt_init_raw",
                 dataset_root=args.dir,
                 extrs_gt=extrs_gt,
                 vggt_cache_subdir="vggt_cache",
@@ -155,87 +135,56 @@ def main():
     # ==========================================
     # 3. 生成隨機 Query Points (於 t=0)
     # ==========================================
+    print(f"🎯 從 t=0 幀深度圖取樣 {args.num_queries} 個追蹤點...")
     t0 = 0
-    viz_pts_sampled = None
-    full_pts_sampled = None
-    len_viz = 0
-    len_full = 0
+    xyz, _ = init_pointcloud_from_rgbd(
+        fmaps=rgbs_tensor[0:1, t0:t0+1].unsqueeze(0).float(),
+        depths=depths_tensor[0:1, t0:t0+1].unsqueeze(0),
+        intrs=intrs_model[0:1, t0:t0+1].unsqueeze(0),
+        extrs=extrs_model[0:1, t0:t0+1].unsqueeze(0),
+        stride=1,
+        level=0,
+    )
+    pts = xyz[t0]  # [H*W, 3] at t=0
     
-    if args.mode in ["viz", "both"]:
-        print(f"🎯 [VIZ 模式] 從 t=0 幀深度圖取樣 {args.num_queries} 個追蹤點...")
-        xyz_viz, _ = init_pointcloud_from_rgbd(
-            fmaps=rgbs_tensor[0:1, t0:t0+1].unsqueeze(0).float(),
-            depths=depths_tensor[0:1, t0:t0+1].unsqueeze(0),
-            intrs=intrs_model[0:1, t0:t0+1].unsqueeze(0),
-            extrs=extrs_model[0:1, t0:t0+1].unsqueeze(0),
-            stride=1,
-            level=0,
-        )
-        pts_viz = xyz_viz[t0]  # [H*W, 3] at t=0
+    if args.mask_img and os.path.exists(args.mask_img):
+        print(f"🖼️ 讀取選點遮罩: {args.mask_img}")
+        mask_pil = Image.open(args.mask_img).convert('L')
+        # 縮放到與追蹤時相同的解析度
+        mask_resized = mask_pil.resize((TARGET_W, TARGET_H), Image.Resampling.BILINEAR)
+        mask_np = np.array(mask_resized)
         
-        if args.mask_img and os.path.exists(args.mask_img):
-            print(f"🖼️ 讀取選點遮罩: {args.mask_img}")
-            mask_pil = Image.open(args.mask_img).convert('L')
-            mask_resized = mask_pil.resize((TARGET_W, TARGET_H), Image.Resampling.BILINEAR)
-            mask_np = np.array(mask_resized)
-            ys, xs = np.where(mask_np > 250)
+        # 找到圖中帶有白色標註的地方 (亮度大於 200)
+        ys, xs = np.where(mask_np > 250)
+        
+        indices = []
+        for y, x in zip(ys, xs):
+            indices.append(y * TARGET_W + x)
             
-            indices = []
-            for y, x in zip(ys, xs):
-                indices.append(y * TARGET_W + x)
-                
-            if len(indices) == 0:
-                print("⚠️ 遮罩中未找到明顯的白色像素標註，將改回隨機取樣。")
-                valid_mask = depths_tensor[0:1, t0, 0].flatten() > 0
-                pool = pts_viz[valid_mask]
-                viz_pts_sampled = pool[torch.randperm(pool.shape[0])[:args.num_queries]]
-            else:
-                indices = list(set(indices))
-                pool = pts_viz[indices]
-                if pool.shape[0] > args.num_queries:
-                    idx = torch.randperm(pool.shape[0])[:args.num_queries]
-                    viz_pts_sampled = pool[idx]
-                else:
-                    viz_pts_sampled = pool
-                print(f"✅ 成功從圖片中讀取 {len(viz_pts_sampled)} 個手動標註點！")
-        else:
+        if len(indices) == 0:
+            print("⚠️ 遮罩中未找到明顯的白色像素標註，將改回隨機取樣。")
             valid_mask = depths_tensor[0:1, t0, 0].flatten() > 0
-            pool = pts_viz[valid_mask]
-            assert pool.shape[0] > 0, "沒有找到有效的深度點來產生 Queries！"
-            idx = torch.randperm(pool.shape[0])[:args.num_queries]
-            viz_pts_sampled = pool[idx]
-            
-    if args.mode in ["full", "both"]:
-        print(f"🎯 [FULL 模式] 從 t=0 幀「全部相機」隨機取樣 {args.full_num_queries} 個追蹤點...")
-        xyz_full, _ = init_pointcloud_from_rgbd(
-            fmaps=rgbs_tensor[:, t0:t0+1].unsqueeze(0).float(),
-            depths=depths_tensor[:, t0:t0+1].unsqueeze(0),
-            intrs=intrs_model[:, t0:t0+1].unsqueeze(0),
-            extrs=extrs_model[:, t0:t0+1].unsqueeze(0),
-            stride=1,
-            level=0,
-        )
-        pts_full = xyz_full[t0]  # [V*H*W, 3] at t=0
-        
-        valid_mask = depths_tensor[:, t0, 0].flatten() > 0
-        pool = pts_full[valid_mask]
-        assert pool.shape[0] > 0, "沒有找到有效的深度點來產生 Queries！"
-        
-        if pool.shape[0] > args.full_num_queries:
-            full_pts_sampled = pool[torch.randperm(pool.shape[0])[:args.full_num_queries]]
+            pool = pts[valid_mask]
+            pts_sampled = pool[torch.randperm(pool.shape[0])[:args.num_queries]]
         else:
-            full_pts_sampled = pool
-        print(f"✅ 成功提取 {len(full_pts_sampled)} 個全景點雲！")
-
-    if args.mode == "viz":
-        pts_sampled = viz_pts_sampled
-    elif args.mode == "full":
-        pts_sampled = full_pts_sampled
+            # 去除重複點並直接取樣，也可以視情況做抽樣控制點數
+            indices = list(set(indices))
+            pool = pts[indices]
+            
+            # 若標註的數量超過設定的查詢數量上限，做隨機降採樣
+            if pool.shape[0] > args.num_queries:
+                idx = torch.randperm(pool.shape[0])[:args.num_queries]
+                pts_sampled = pool[idx]
+            else:
+                pts_sampled = pool
+                
+            print(f"✅ 成功從圖片中讀取 {len(pts_sampled)} 個手動標註點！")
     else:
-        # both: 將 viz (mask) 和 full 合併追蹤
-        len_viz = len(viz_pts_sampled)
-        len_full = len(full_pts_sampled)
-        pts_sampled = torch.cat([viz_pts_sampled, full_pts_sampled], dim=0)
+        valid_mask = depths_tensor[0:1, t0, 0].flatten() > 0
+        pool = pts[valid_mask]
+        assert pool.shape[0] > 0, "沒有找到有效的深度點來產生 Queries！"
+        idx = torch.randperm(pool.shape[0])[:args.num_queries]
+        pts_sampled = pool[idx]
     
     ts = torch.full((pts_sampled.shape[0], 1), float(t0), device=pts_sampled.device)
     query_points = torch.cat([ts, pts_sampled], dim=1).float()  # (N,4): (t,x,y,z)
@@ -249,7 +198,6 @@ def main():
     torch.set_float32_matmul_precision("high")
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
     
-    start_time = time.time()
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
         # 這裡需要加上 [None] batch 維度，並把 RGB 縮放到 0~1
         results = mvtracker(
@@ -259,40 +207,15 @@ def main():
             extrs=extrs_model[None].to(device),
             query_points_3d=query_points[None].to(device),
         )
-    end_time = time.time()
     pred_tracks = results["traj_e"].cpu()  # [T,N,3]
     pred_vis = results["vis_e"].cpu()      # [T,N]
-    
-    print(f"✅ 追蹤完成！ (花費時間: {end_time - start_time:.2f} 秒)")
+    print("✅ 追蹤完成！")
 
     # ==========================================
     # 5. 視覺化 (匯出至 Rerun)
     # ==========================================
-    if args.mode == "full":
-        print("⏭️  [FULL 模式] 略過視覺化，測試結束。")
-        return
-
-    if args.mode == "both":
-        print(f"🎲 [BOTH 模式] 從測速的 {len_full} 個點中隨機抽樣 {args.num_queries} 個點，再加上 {len_viz} 個標註點進行視覺化...")
-        
-        # 標註點的 indices (前 len_viz 個)
-        idx_viz = torch.arange(len_viz)
-        
-        # 從 full random 取樣的 points 中隨機挑 args.num_queries 個
-        num_viz_from_full = min(args.num_queries, len_full)
-        idx_full = torch.randperm(len_full)[:num_viz_from_full] + len_viz
-        
-        viz_indices = torch.cat([idx_viz, idx_full])
-        viz_pred_tracks = pred_tracks[:, :, viz_indices]
-        viz_pred_vis = pred_vis[:, :, viz_indices]
-        viz_query_points = query_points[viz_indices]
-    else:
-        viz_pred_tracks = pred_tracks
-        viz_pred_vis = pred_vis
-        viz_query_points = query_points
-
     print("🎨 正在打包 Rerun 視覺化檔案...")
-    rr.init("n3d_tracking", recording_id="v0.16")
+    rr.init("bullpen_tracking", recording_id="v0.16")
     if args.rerun == "stream":
         rr.connect_tcp()
     elif args.rerun == "spawn":
@@ -302,7 +225,7 @@ def main():
     scene_center = gt_centers_all.mean(dim=0).flatten().cpu().numpy()
 
     log_pointclouds_to_rerun(
-        dataset_name="n3d",
+        dataset_name="bullpen",
         datapoint_idx=0,
         rgbs=rgbs_tensor[None],
         depths=depths_tensor[None],
@@ -324,14 +247,14 @@ def main():
     )
     
     log_tracks_to_rerun(
-        dataset_name="n3d",
+        dataset_name="bullpen",
         datapoint_idx=0,
         predictor_name="MVTracker",
         gt_trajectories_3d_worldspace=None,
         gt_visibilities_any_view=None,
-        query_points_3d=viz_query_points[None],
-        pred_trajectories=viz_pred_tracks,
-        pred_visibilities=viz_pred_vis,
+        query_points_3d=query_points[None],
+        pred_trajectories=pred_tracks,
+        pred_visibilities=pred_vis,
         per_track_results=None,
         radii_scale=1.0,
         fps=30,

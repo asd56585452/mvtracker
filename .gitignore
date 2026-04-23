@@ -19,4 +19,4 @@ logs*
 /outputs
 /wandb
 *.rrd
-mask.jpg
+mask*.jpg
