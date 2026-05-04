@@ -51,11 +51,12 @@ def main():
     p.add_argument("--num_queries", type=int, default=512, help="要追蹤的點數量")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
     p.add_argument("--mask_img", type=str, default="mask.jpg", help="提供白色像素標註追蹤點的遮罩圖片路徑 (例如: mask.png)")
-    p.add_argument("--mode", type=str, choices=["viz", "full", "both"], default="viz", help="運行模式: viz(視覺化), full(抽20萬點測速), both(測速並隨機抽樣視覺化)")
+    p.add_argument("--mode", type=str, choices=["viz", "full", "both", "prove"], default="viz", help="運行模式: viz(視覺化), full(抽20萬點測速), both(測速並視覺化), prove(證明點間干擾)")
     p.add_argument("--full_num_queries", type=int, default=200000, help="正式測試模式要追蹤的總點數量")
     p.add_argument("--rerun", choices=["save", "spawn", "stream"], default="save")
     p.add_argument("--lightweight", action="store_true", help="使用輕量級視覺化 (適合網頁版 Viewer)")
     p.add_argument("--rrd", default="n3d_mvtracker_demo.rrd", help="輸出的 Rerun 檔名")
+    p.add_argument("--start_frame", type=int, default=0, help="開始追蹤的幀數 (設定 t0)")
     args = p.parse_args()
 
     np.random.seed(72)
@@ -153,16 +154,18 @@ def main():
         extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
 
     # ==========================================
-    # 3. 生成隨機 Query Points (於 t=0)
+    # 3. 生成隨機 Query Points (於 t0)
     # ==========================================
-    t0 = 0
+    t0 = args.start_frame
     viz_pts_sampled = None
     full_pts_sampled = None
     len_viz = 0
     len_full = 0
+    viz_pixel_coords = None
+    full_pixel_coords = None
     
     if args.mode in ["viz", "both"]:
-        print(f"🎯 [VIZ 模式] 從 t=0 幀深度圖取樣 {args.num_queries} 個追蹤點...")
+        print(f"🎯 [VIZ 模式] 從 t={t0} 幀深度圖取樣 {args.num_queries} 個追蹤點...")
         xyz_viz, _ = init_pointcloud_from_rgbd(
             fmaps=rgbs_tensor[0:1, t0:t0+1].unsqueeze(0).float(),
             depths=depths_tensor[0:1, t0:t0+1].unsqueeze(0),
@@ -171,7 +174,7 @@ def main():
             stride=1,
             level=0,
         )
-        pts_viz = xyz_viz[t0]  # [H*W, 3] at t=0
+        pts_viz = xyz_viz[0]  # [H*W, 3] at t=t0
         
         if args.mask_img and os.path.exists(args.mask_img):
             print(f"🖼️ 讀取選點遮罩: {args.mask_img}")
@@ -193,49 +196,79 @@ def main():
                 indices = list(set(indices))
                 pool = pts_viz[indices]
                 if pool.shape[0] > args.num_queries:
-                    idx = torch.randperm(pool.shape[0])[:args.num_queries]
-                    viz_pts_sampled = pool[idx]
+                    rand_idx = torch.randperm(pool.shape[0])[:args.num_queries]
+                    viz_pts_sampled = pool[rand_idx]
+                    chosen_idx = torch.tensor(indices)[rand_idx]
                 else:
                     viz_pts_sampled = pool
+                    chosen_idx = torch.tensor(indices)
                 print(f"✅ 成功從圖片中讀取 {len(viz_pts_sampled)} 個手動標註點！")
+                
+                viz_pixel_coords = torch.stack([
+                    torch.zeros_like(chosen_idx), 
+                    chosen_idx // TARGET_W, 
+                    chosen_idx % TARGET_W 
+                ], dim=1)
         else:
             valid_mask = depths_tensor[0:1, t0, 0].flatten() > 0
+            valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
             pool = pts_viz[valid_mask]
             assert pool.shape[0] > 0, "沒有找到有效的深度點來產生 Queries！"
-            idx = torch.randperm(pool.shape[0])[:args.num_queries]
-            viz_pts_sampled = pool[idx]
+            rand_idx = torch.randperm(pool.shape[0])[:args.num_queries]
+            viz_pts_sampled = pool[rand_idx]
+            chosen_idx = valid_indices[rand_idx]
             
-    if args.mode in ["full", "both"]:
-        print(f"🎯 [FULL 模式] 從 t=0 幀「全部相機」隨機取樣 {args.full_num_queries} 個追蹤點...")
-        xyz_full, _ = init_pointcloud_from_rgbd(
-            fmaps=rgbs_tensor[:, t0:t0+1].unsqueeze(0).float(),
-            depths=depths_tensor[:, t0:t0+1].unsqueeze(0),
-            intrs=intrs_model[:, t0:t0+1].unsqueeze(0),
-            extrs=extrs_model[:, t0:t0+1].unsqueeze(0),
-            stride=1,
-            level=0,
-        )
-        pts_full = xyz_full[t0]  # [V*H*W, 3] at t=0
-        
+            viz_pixel_coords = torch.stack([
+                torch.zeros_like(chosen_idx), 
+                chosen_idx // TARGET_W, 
+                chosen_idx % TARGET_W 
+            ], dim=1)
+            
+    if args.mode in ["full", "both", "prove"]:
+        print(f"🎯 [FULL 模式] 從 t={t0} 幀「全部相機」隨機取樣 {args.full_num_queries} 個追蹤點...")
+        with torch.no_grad():
+            xyz_full, rgb_full = init_pointcloud_from_rgbd(
+                fmaps=rgbs_tensor[:, t0:t0+1].unsqueeze(0).float(),
+                depths=depths_tensor[:, t0:t0+1].unsqueeze(0),
+                intrs=intrs_model[:, t0:t0+1].unsqueeze(0),
+                extrs=extrs_model[:, t0:t0+1].unsqueeze(0),
+                stride=1,
+                level=0,
+            )
+        pts_full = xyz_full[0]  # [V*H*W, 3] at t=t0
         valid_mask = depths_tensor[:, t0, 0].flatten() > 0
+        valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
         pool = pts_full[valid_mask]
         assert pool.shape[0] > 0, "沒有找到有效的深度點來產生 Queries！"
         
         if pool.shape[0] > args.full_num_queries:
-            full_pts_sampled = pool[torch.randperm(pool.shape[0])[:args.full_num_queries]]
+            rand_idx = torch.randperm(pool.shape[0])[:args.full_num_queries]
+            full_pts_sampled = pool[rand_idx]
+            chosen_idx = valid_indices[rand_idx]
         else:
             full_pts_sampled = pool
+            chosen_idx = valid_indices
+            
+        full_pixel_coords = torch.stack([
+            chosen_idx // (TARGET_H * TARGET_W), 
+            (chosen_idx % (TARGET_H * TARGET_W)) // TARGET_W, 
+            chosen_idx % TARGET_W 
+        ], dim=1)
+        
         print(f"✅ 成功提取 {len(full_pts_sampled)} 個全景點雲！")
 
     if args.mode == "viz":
         pts_sampled = viz_pts_sampled
-    elif args.mode == "full":
+        pixel_coords = viz_pixel_coords
+    elif args.mode in ["full", "prove"]:
         pts_sampled = full_pts_sampled
+        pixel_coords = full_pixel_coords
     else:
         # both: 將 viz (mask) 和 full 合併追蹤
         len_viz = len(viz_pts_sampled)
         len_full = len(full_pts_sampled)
         pts_sampled = torch.cat([viz_pts_sampled, full_pts_sampled], dim=0)
+        pixel_coords = torch.cat([viz_pixel_coords, full_pixel_coords], dim=0)
     
     ts = torch.full((pts_sampled.shape[0], 1), float(t0), device=pts_sampled.device)
     query_points = torch.cat([ts, pts_sampled], dim=1).float()  # (N,4): (t,x,y,z)
@@ -249,6 +282,56 @@ def main():
     torch.set_float32_matmul_precision("high")
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
     
+    if args.mode == "prove":
+        print("\n" + "="*50)
+        print("🎯 [PROVE 模式] 證明點間干擾 (Interference Proof)")
+        print("="*50)
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
+            print("🚀 [1/2] 單獨追蹤第 0 個目標點...")
+            res_single = mvtracker(
+                rgbs=rgbs_tensor[None].cpu(),
+                depths=depths_tensor[None].cpu(),
+                intrs=intrs_model[None].to(device),
+                extrs=extrs_model[None].to(device),
+                query_points_3d=query_points[None, 0:1].to(device), # Only point 0
+            )
+            print(f"🚀 [2/2] 與其他 {args.full_num_queries-1} 個點一起追蹤...")
+            res_group = mvtracker(
+                rgbs=rgbs_tensor[None].cpu(),
+                depths=depths_tensor[None].cpu(),
+                intrs=intrs_model[None].to(device),
+                extrs=extrs_model[None].to(device),
+                query_points_3d=query_points[None].to(device), # All points
+            )
+            
+        track_single = res_single["traj_e"].cpu()
+        if track_single.dim() == 4:
+            track_single = track_single[0] # [T, N, 3]
+        track_single = track_single[:, 0, :] # [T, 3]
+        
+        track_group_target = res_group["traj_e"].cpu()
+        if track_group_target.dim() == 4:
+            track_group_target = track_group_target[0] # [T, N, 3]
+        track_group_target = track_group_target[:, 0, :] # [T, 3]
+        
+        diff = torch.norm(track_single - track_group_target, dim=-1) # [T]
+        print("\n📊 結論: 同一個目標點在「單獨追蹤」vs「群體追蹤」的位移差異 (Euclidean Error):")
+        for t in range(diff.shape[0]):
+            print(f"Frame {t}: 相差 {diff[t].item():.6f} 單位")
+            
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 5))
+        plt.plot(diff.numpy(), label='Deviation caused by other queries', color='red', marker='o')
+        plt.xlabel('Frame')
+        plt.ylabel('Deviation Error (World Units)')
+        plt.title('Target Point Trajectory Deviation (Single vs Group)')
+        plt.legend()
+        plt.grid(True)
+        plot_path = os.path.join(args.dir, "interference_proof.png")
+        plt.savefig(plot_path)
+        print(f"✅ 干擾證明圖表已儲存至 {plot_path}")
+        return
+
     start_time = time.time()
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
         # 這裡需要加上 [None] batch 維度，並把 RGB 縮放到 0~1
@@ -283,13 +366,15 @@ def main():
         idx_full = torch.randperm(len_full)[:num_viz_from_full] + len_viz
         
         viz_indices = torch.cat([idx_viz, idx_full])
-        viz_pred_tracks = pred_tracks[:, :, viz_indices]
-        viz_pred_vis = pred_vis[:, :, viz_indices]
+        viz_pred_tracks = pred_tracks[:, viz_indices]
+        viz_pred_vis = pred_vis[:, viz_indices]
         viz_query_points = query_points[viz_indices]
+        viz_final_pixel_coords = pixel_coords[viz_indices]
     else:
         viz_pred_tracks = pred_tracks
         viz_pred_vis = pred_vis
         viz_query_points = query_points
+        viz_final_pixel_coords = pixel_coords
 
     print("🎨 正在打包 Rerun 視覺化檔案...")
     rr.init("n3d_tracking", recording_id="v0.16")
@@ -348,6 +433,74 @@ def main():
     if args.rerun == "save":
         rr.save(args.rrd)
         print(f"🎉 成功儲存 Rerun 檔案至: {os.path.abspath(args.rrd)}")
+
+    # ==========================================
+    # 6. 漂移驗證 (Drift Analysis)
+    # ==========================================
+    print("🔍 進行漂移驗證 (Drift Analysis)...")
+    cam_idx = viz_final_pixel_coords[:, 0]
+    y = viz_final_pixel_coords[:, 1]
+    x = viz_final_pixel_coords[:, 2]
+
+    T_frames = depths_tensor.shape[1]
+    N_pts = len(viz_final_pixel_coords)
+    
+    vggt_tracks = torch.zeros((T_frames, N_pts, 3), device=device)
+    depths_tensor_dev = depths_tensor.to(device)
+    intrs_model_dev = intrs_model.to(device)
+    extrs_model_dev = extrs_model.to(device)
+
+    pixel_homo = torch.stack([x.float(), y.float(), torch.ones_like(x).float()], dim=-1).to(device)
+    
+    for t in range(T_frames):
+        d_t = depths_tensor_dev[cam_idx, t, 0, y, x] 
+        K_t = intrs_model_dev[cam_idx, t] 
+        E_t = extrs_model_dev[cam_idx, t] 
+        
+        K_inv = torch.inverse(K_t) 
+        cam_ray = torch.bmm(K_inv, pixel_homo.unsqueeze(-1)).squeeze(-1) 
+        cam_xyz = cam_ray * d_t.unsqueeze(-1) 
+        
+        R = E_t[:, :3, :3] 
+        Tr = E_t[:, :3, 3] 
+        
+        X_c_minus_Tr = cam_xyz - Tr
+        R_inv = R.transpose(1, 2)
+        world_xyz = torch.bmm(R_inv, X_c_minus_Tr.unsqueeze(-1)).squeeze(-1) 
+        vggt_tracks[t] = world_xyz
+
+    pred_tracks_dev = viz_pred_tracks.to(device)
+    if pred_tracks_dev.dim() == 4:
+        pred_tracks_dev = pred_tracks_dev[0]
+    
+    mv_drift = torch.norm(pred_tracks_dev - pred_tracks_dev[t0:t0+1], dim=-1) 
+    vggt_drift = torch.norm(vggt_tracks - vggt_tracks[t0:t0+1], dim=-1) 
+
+    mv_drift_mean = mv_drift.mean(dim=1).cpu().numpy()
+    vggt_drift_mean = vggt_drift.mean(dim=1).cpu().numpy()
+    
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 6))
+    plt.plot(mv_drift_mean, label='MVTracker Mean Drift', color='blue', linewidth=2)
+    plt.plot(vggt_drift_mean, label='VGGT Mean Drift', color='orange', linewidth=2, linestyle='--')
+    plt.xlabel('Frame')
+    plt.ylabel(f'Mean Displacement from t={t0} (World Units)')
+    plt.title(f'Drift Analysis Over Time (Static Scene Assumption) - Start t={t0}\nMode: {args.mode}, Points: {N_pts}')
+    plt.legend()
+    plt.grid(True)
+    plot_path = os.path.join(args.dir, f"drift_analysis_demo_{args.mode}.png")
+    plt.savefig(plot_path)
+    plt.close()
+    
+    threshold = 0.5
+    mv_bad_pct = (mv_drift[-1] > threshold).float().mean().item() * 100
+    vggt_bad_pct = (vggt_drift[-1] > threshold).float().mean().item() * 100
+    
+    print(f"📊 漂移分析圖表已儲存至 {plot_path}")
+    print(f"   - MVTracker 最後一幀平均漂移: {mv_drift_mean[-1]:.4f} 單位")
+    print(f"   - VGGT      最後一幀平均漂移: {vggt_drift_mean[-1]:.4f} 單位")
+    print(f"   - MVTracker > {threshold} 單位移動的點比例: {mv_bad_pct:.2f}%")
+    print(f"   - VGGT      > {threshold} 單位移動的點比例: {vggt_bad_pct:.2f}%")
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore", message=".*DtypeTensor constructors are no longer.*", module="pointops.query")

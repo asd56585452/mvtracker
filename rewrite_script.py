@@ -1,154 +1,19 @@
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import argparse
 import re
-import time
-import glob
-import gc
 
-import matplotlib.pyplot as plt
-import numpy as np
-import torch
-from PIL import Image
-from torchvision.transforms.functional import to_tensor
-from tqdm import tqdm
-from plyfile import PlyData, PlyElement
+with open("scripts/prepare_n3d_mvtracker_track.py", "r") as f:
+    code = f.read()
 
-from mvtracker.datasets.generic_scene_dataset import _ensure_vggt_aligned_cache_and_load
-from mvtracker.models.core.model_utils import init_pointcloud_from_rgbd
-from sklearn.cluster import MiniBatchKMeans
+# 1. Update argparse
+argparse_target = 'p.add_argument("--export_per_frame_ply", action="store_true", help="是否將每一幀的軌跡儲存為獨立的 PLY 檔以供檢查")'
+argparse_replace = argparse_target + '\n    p.add_argument("--segment_frames", type=int, default=50, help="每個追蹤片段的長度 (幀數)")'
+code = code.replace(argparse_target, argparse_replace)
 
-def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
-    """將 LLFF 轉換為 OpenCV，並進行解析度焦距自適應縮放"""
-    H_bound, W_bound, f_bound = pose_llff[:, 4]
-    scale_x = actual_W / W_bound
-    scale_y = actual_H / H_bound
-    
-    K = np.array([
-        [f_bound * scale_x, 0, actual_W / 2.0],
-        [0, f_bound * scale_y, actual_H / 2.0],
-        [0, 0, 1]
-    ], dtype=np.float32)
+# 2. Replace lines 148 to end
+split_marker = "# ==========================================\n    # 3. 生成隨機 Query Points (於 t=0)\n    # =========================================="
 
-    R_llff = pose_llff[:, :3]
-    t_llff = pose_llff[:, 3]
-
-    R_cv = np.zeros_like(R_llff)
-    R_cv[:, 0] = R_llff[:, 1]
-    R_cv[:, 1] = R_llff[:, 0]
-    R_cv[:, 2] = -R_llff[:, 2]
-
-    c2w_cv = np.eye(4, dtype=np.float32)
-    c2w_cv[:3, :3] = R_cv
-    c2w_cv[:3, 3] = t_llff
-
-    w2c_cv = np.linalg.inv(c2w_cv)[:3, :4]
-    return w2c_cv, K
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--dir", type=str, required=True, help="n3d 資料集路徑")
-    p.add_argument("--max_frames", type=int, default=300, help="限制載入的最大幀數 (避免 MVTracker OOM)")
-    p.add_argument("--num_queries", type=int, default=200000, help="要追蹤的點數量")
-    p.add_argument("--selected_cams", type=int, nargs="+", default=[16, 10, 13, 1, 18], help="選擇的相機 ID 列表")
-    p.add_argument("--track_chunk_size", type=int, default=10000, help="MVTracker 追蹤時的分批大小，避免 OOM")
-    p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
-    p.add_argument("--export_per_frame_ply", action="store_true", help="是否將每一幀的軌跡儲存為獨立的 PLY 檔以供檢查")
-    p.add_argument("--segment_frames", type=int, default=50, help="每個追蹤片段的長度 (幀數)")
-    p.add_argument("--voxel_size", type=float, default=0.05, help="Voxel downsample 的體素大小")
-    args = p.parse_args()
-
-    np.random.seed(72)
-    torch.manual_seed(72)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # ==========================================
-    # 1. 讀取影像與相機姿態
-    # ==========================================
-    view_dirs = sorted(
-        glob.glob(os.path.join(args.dir, 'view_*')), 
-        key=lambda x: int(re.search(r'\d+', os.path.basename(x)).group())
-    )
-    sample_frames = sorted(glob.glob(os.path.join(view_dirs[0], '*.jpg')))
-    num_frames = min(len(sample_frames), args.max_frames)
-    sample_img = Image.open(sample_frames[0])
-    W_img, H_img = sample_img.size
-    print(f"📷 處理圖片: {W_img}x{H_img} | 取樣幀數: {num_frames} 幀")
-
-    poses_path = os.path.join(args.dir, 'poses_bounds.npy')
-    poses_bounds = np.load(poses_path)
-    all_poses_llff = poses_bounds[:, :-2].reshape([-1, 3, 5])
-    
-    all_w2c, all_intrs = [], []
-    for i in range(len(all_poses_llff)):
-        w2c, K = llff_to_opencv_w2c(all_poses_llff[i], W_img, H_img)
-        all_w2c.append(w2c)
-        all_intrs.append(K)
-    all_w2c_np = np.stack(all_w2c)
-    all_intrs_np = np.stack(all_intrs)
-
-    # 儲存所有相機供 4DGS 使用
-    npz_path = os.path.join(args.dir, "estimated_cameras_vggt.npz")
-    np.savez(npz_path, w2c_poses=all_w2c_np, intrs=all_intrs_np)
-    print(f"✅ 相機參數已儲存至 {npz_path}")
-
-    SELECTED_CAMS = args.selected_cams
-    V = len(SELECTED_CAMS)
-    
-    TARGET_W, TARGET_H = 768, 576
-    scale_x = TARGET_W / W_img
-    scale_y = TARGET_H / H_img
-    extrs_list, intrs_list = [], []
-    for cam_idx in SELECTED_CAMS:
-        extrs_list.append(torch.from_numpy(all_w2c_np[cam_idx]).float())
-        K_original = all_intrs_np[cam_idx].copy()
-        K_original[0, :] *= scale_x  
-        K_original[1, :] *= scale_y  
-        intrs_list.append(torch.from_numpy(K_original).float())
-        
-    extrs_gt = torch.stack(extrs_list).unsqueeze(1).repeat(1, num_frames, 1, 1)
-    intrs_gt = torch.stack(intrs_list).unsqueeze(1).repeat(1, num_frames, 1, 1)
-
-    # ==========================================
-    # 2. 收集所有幀的 RGB 與 VGGT 深度
-    # ==========================================
-    print("🚀 讀取 RGB 影像並整理資料...")
-    rgbs_list = []
-    for cam_idx in tqdm(SELECTED_CAMS, desc="RGB 讀取進度"):
-        frames = sorted(glob.glob(os.path.join(view_dirs[cam_idx], '*.jpg')))[:num_frames]
-        cam_rgbs = []
-        for t in range(num_frames):
-            img = Image.open(frames[t]).convert('RGB')
-            img_resized = img.resize((TARGET_W, TARGET_H), Image.Resampling.BILINEAR)
-            cam_rgbs.append((to_tensor(img_resized) * 255).byte()) # [3, H, W] uint8
-        rgbs_list.append(torch.stack(cam_rgbs)) # [T, 3, H, W]
-    
-    rgbs_tensor = torch.stack(rgbs_list) # [V, T, 3, H, W]
-
-    seq_name = "n3d_gt_init_aligned" if args.use_dynamic_vggt_cameras else "n3d_gt_init_raw"
-    print(f"🚀 提取 VGGT 深度 (模式: {seq_name})...")
-    with torch.no_grad():
-        depths_tensor, _, intrs_vggt, extrs_vggt = _ensure_vggt_aligned_cache_and_load(
-            rgbs=rgbs_tensor,
-            seq_name=seq_name,
-            dataset_root=args.dir,
-            extrs_gt=extrs_gt,
-            vggt_cache_subdir="vggt_cache",
-            skip_if_cached=False,
-            model_id="facebook/VGGT-1B",
-        )
-
-    if args.use_dynamic_vggt_cameras:
-        intrs_model = intrs_vggt
-        extrs_model = extrs_vggt
-    else:
-        # 套用第1幀內外參至所有後續幀
-        intrs_model = intrs_vggt[:, 0:1].expand_as(intrs_vggt).clone()
-        extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
-
-    # ==========================================
+parts = code.split(split_marker)
+if len(parts) == 2:
+    new_tail = """# ==========================================
     # 3. 載入 MVTracker 模型
     # ==========================================
     print("🧠 載入 MVTracker...")
@@ -168,7 +33,7 @@ def main():
         chunk_dir = os.path.join(args.dir, f"{start_t}-{end_t-1}frame")
         os.makedirs(chunk_dir, exist_ok=True)
         
-        print(f"\n" + "="*50)
+        print(f"\\n" + "="*50)
         print(f"🎬 開始處理片段: {start_t} 到 {end_t-1} 幀 (共 {chunk_frames} 幀)")
         print("="*50)
 
@@ -196,60 +61,16 @@ def main():
         pool_colors = colors_full[valid_mask]
         assert pool_pts.shape[0] > 0, f"在 t={t0} 沒有找到有效的深度點來產生 Queries！"
         
-        pts_np = pool_pts.cpu().numpy()
-        colors_np = pool_colors.cpu().numpy()
-        
-        # Step 1: Voxel Downsample
-        print(f"   [Voxel Downsample] 原始有效點數: {len(pts_np)}")
-        coords = np.round(pts_np / args.voxel_size)
-        _, unique_indices = np.unique(coords, axis=0, return_index=True)
-        pts_voxel = pts_np[unique_indices]
-        colors_voxel = colors_np[unique_indices]
-        orig_idx_voxel = valid_indices.cpu().numpy()[unique_indices]
-        print(f"   [Voxel Downsample] 降採樣後點數: {len(pts_voxel)} (voxel_size={args.voxel_size})")
-        
-        # Step 2: 空間分群 (Spatial Clustering)
-        chunk_size = args.track_chunk_size
-        num_groups = max(1, args.num_queries // chunk_size)
-        print(f"   [Spatial Clustering] 將點雲分為 {num_groups} 個群組 (每組預期 ~{chunk_size} 點)...")
-        
-        kmeans = MiniBatchKMeans(n_clusters=num_groups, random_state=72, n_init="auto")
-        labels = kmeans.fit_predict(pts_voxel)
-        
-        # Step 3: 隨機抽樣與排序 (Group-based Sampling)
-        sampled_pts_list = []
-        sampled_colors_list = []
-        sampled_orig_list = []
-        
-        for g in range(num_groups):
-            mask = (labels == g)
-            g_pts = pts_voxel[mask]
-            g_colors = colors_voxel[mask]
-            g_orig = orig_idx_voxel[mask]
-            
-            if len(g_pts) > chunk_size:
-                idx = np.random.choice(len(g_pts), chunk_size, replace=False)
-                g_pts = g_pts[idx]
-                g_colors = g_colors[idx]
-                g_orig = g_orig[idx]
-                
-            sampled_pts_list.append(g_pts)
-            sampled_colors_list.append(g_colors)
-            sampled_orig_list.append(g_orig)
-            
-        pts_sampled_np = np.concatenate(sampled_pts_list, axis=0)
-        colors_sampled_np = np.concatenate(sampled_colors_list, axis=0)
-        orig_idx_sampled_np = np.concatenate(sampled_orig_list, axis=0)
-        
-        # 如果總數還是超過 num_queries，直接截斷（因為已經照群組排好，截斷只會影響最後一組）
-        if len(pts_sampled_np) > args.num_queries:
-            pts_sampled_np = pts_sampled_np[:args.num_queries]
-            colors_sampled_np = colors_sampled_np[:args.num_queries]
-            orig_idx_sampled_np = orig_idx_sampled_np[:args.num_queries]
-            
-        pts_sampled = torch.from_numpy(pts_sampled_np).to(device)
-        colors_sampled = torch.from_numpy(colors_sampled_np).to(device)
-        original_idx = torch.from_numpy(orig_idx_sampled_np).to(device)
+        if pool_pts.shape[0] > args.num_queries:
+            idx = torch.randperm(pool_pts.shape[0])[:args.num_queries]
+            pts_sampled = pool_pts[idx]
+            colors_sampled = pool_colors[idx]
+            original_idx = valid_indices[idx]
+        else:
+            idx = torch.arange(pool_pts.shape[0])
+            pts_sampled = pool_pts
+            colors_sampled = pool_colors
+            original_idx = valid_indices
             
         print(f"✅ 成功提取 {len(pts_sampled)} 個初始點雲！")
 
@@ -410,10 +231,19 @@ def main():
         print(f"   - MVTracker 片段最後一幀平均漂移: {mv_drift_mean[-1]:.4f} 單位")
         print(f"   - VGGT      片段最後一幀平均漂移: {vggt_drift_mean[-1]:.4f} 單位")
         print(f"   - MVTracker > {threshold} 單位移動的點比例: {mv_bad_pct:.2f}%")
-        print(f"   - VGGT      > {threshold} 單位移動的點比例: {vggt_bad_pct:.2f}%\n")
+        print(f"   - VGGT      > {threshold} 單位移動的點比例: {vggt_bad_pct:.2f}%\\n")
 
 if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore", message=".*DtypeTensor constructors are no longer.*", module="pointops.query")
     warnings.filterwarnings("ignore", message=".*Plan failed with a cudnnException.*", module="torch.nn.modules.conv")
     main()
+"""
+    code = parts[0] + new_tail
+
+    with open("scripts/prepare_n3d_mvtracker_track.py", "w") as f:
+        f.write(code)
+    print("Replacement successful.")
+else:
+    print("Could not find split_marker!")
+
