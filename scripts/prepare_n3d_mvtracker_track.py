@@ -19,6 +19,7 @@ from plyfile import PlyData, PlyElement
 from mvtracker.datasets.generic_scene_dataset import _ensure_vggt_aligned_cache_and_load
 from mvtracker.models.core.model_utils import init_pointcloud_from_rgbd
 from sklearn.cluster import MiniBatchKMeans
+from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
 
 def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
     """將 LLFF 轉換為 OpenCV，並進行解析度焦距自適應縮放"""
@@ -48,16 +49,18 @@ def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
     return w2c_cv, K
 
 def main():
+    full_start_time = time.time()
     p = argparse.ArgumentParser()
     p.add_argument("--dir", type=str, required=True, help="n3d 資料集路徑")
     p.add_argument("--max_frames", type=int, default=300, help="限制載入的最大幀數 (避免 MVTracker OOM)")
-    p.add_argument("--num_queries", type=int, default=200000, help="要追蹤的點數量")
     p.add_argument("--selected_cams", type=int, nargs="+", default=[16, 10, 13, 1, 18], help="選擇的相機 ID 列表")
     p.add_argument("--track_chunk_size", type=int, default=10000, help="MVTracker 追蹤時的分批大小，避免 OOM")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
     p.add_argument("--export_per_frame_ply", action="store_true", help="是否將每一幀的軌跡儲存為獨立的 PLY 檔以供檢查")
     p.add_argument("--segment_frames", type=int, default=50, help="每個追蹤片段的長度 (幀數)")
-    p.add_argument("--voxel_size", type=float, default=0.05, help="Voxel downsample 的體素大小")
+    p.add_argument("--voxel_size", type=float, default=0.1, help="Voxel downsample 的體素大小")
+    p.add_argument("--use_raft_mask", action="store_true", help="使用 RAFT 光流來過濾靜態背景點")
+    p.add_argument("--raft_threshold", type=float, default=1.0, help="RAFT 判定為移動的像素閾值")
     args = p.parse_args()
 
     np.random.seed(72)
@@ -149,12 +152,21 @@ def main():
         extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
 
     # ==========================================
-    # 3. 載入 MVTracker 模型
+    # 3. 載入模型 (MVTracker, RAFT)
     # ==========================================
     print("🧠 載入 MVTracker...")
     mvtracker = torch.hub.load(".", "mvtracker", source="local", pretrained=True, device=device)
     torch.set_float32_matmul_precision("high")
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+
+    raft_model = None
+    raft_transforms = None
+    if args.use_raft_mask:
+        print("🌊 載入 RAFT 光流模型 (動靜態分離)...")
+        weights = Raft_Large_Weights.DEFAULT
+        raft_transforms = weights.transforms()
+        raft_model = raft_large(weights=weights, progress=False).to(device)
+        raft_model.eval()
 
     # ==========================================
     # 4. 分段追蹤 (Chunk-based Tracking)
@@ -173,10 +185,10 @@ def main():
         print("="*50)
 
         # ------------------------------------------
-        # 4.1 生成隨機 Query Points (於 t0 = start_t)
+        # 4.1 生成 Query Points (由 voxel_size 決定總數與密度)
         # ------------------------------------------
         t0 = start_t
-        print(f"🎯 從 t={t0} 幀「全部相機」萃取並隨機取樣 {args.num_queries} 個追蹤點...")
+        print(f"🎯 從 t={t0} 幀「全部相機」萃取追蹤點 (統一 Voxelize 融合)...")
         with torch.no_grad():
             xyz_full, rgb_full = init_pointcloud_from_rgbd(
                 fmaps=rgbs_tensor[:, t0:t0+1].unsqueeze(0).float(),
@@ -187,75 +199,135 @@ def main():
                 level=0,
             )
         
-        pts_full = xyz_full[0]  # [V*H*W, 3] at relative t=0
-        colors_full = rgb_full[0] # [V*H*W, 3]
+        pts_full = xyz_full[0]  
+        colors_full = rgb_full[0] 
         
         valid_mask = depths_tensor[:, t0, 0].flatten() > 0
-        valid_indices = torch.nonzero(valid_mask, as_tuple=True)[0]
-        pool_pts = pts_full[valid_mask]
-        pool_colors = colors_full[valid_mask]
-        assert pool_pts.shape[0] > 0, f"在 t={t0} 沒有找到有效的深度點來產生 Queries！"
+        motion_mask = torch.zeros_like(valid_mask)
         
-        pts_np = pool_pts.cpu().numpy()
-        colors_np = pool_colors.cpu().numpy()
-        
-        # Step 1: Voxel Downsample
-        print(f"   [Voxel Downsample] 原始有效點數: {len(pts_np)}")
-        coords = np.round(pts_np / args.voxel_size)
-        _, unique_indices = np.unique(coords, axis=0, return_index=True)
-        pts_voxel = pts_np[unique_indices]
-        colors_voxel = colors_np[unique_indices]
-        orig_idx_voxel = valid_indices.cpu().numpy()[unique_indices]
-        print(f"   [Voxel Downsample] 降採樣後點數: {len(pts_voxel)} (voxel_size={args.voxel_size})")
-        
-        # Step 2: 空間分群 (Spatial Clustering)
-        chunk_size = args.track_chunk_size
-        num_groups = max(1, args.num_queries // chunk_size)
-        print(f"   [Spatial Clustering] 將點雲分為 {num_groups} 個群組 (每組預期 ~{chunk_size} 點)...")
-        
-        kmeans = MiniBatchKMeans(n_clusters=num_groups, random_state=72, n_init="auto")
-        labels = kmeans.fit_predict(pts_voxel)
-        
-        # Step 3: 隨機抽樣與排序 (Group-based Sampling)
-        sampled_pts_list = []
-        sampled_colors_list = []
-        sampled_orig_list = []
-        
-        for g in range(num_groups):
-            mask = (labels == g)
-            g_pts = pts_voxel[mask]
-            g_colors = colors_voxel[mask]
-            g_orig = orig_idx_voxel[mask]
+        if args.use_raft_mask and raft_model is not None:
+            print(f"🌊 計算 RAFT 動靜態遮罩 (Threshold: {args.raft_threshold})...")
+            raft_model.to(device)
+            max_flow_mag = torch.zeros(V, TARGET_H, TARGET_W, device=device)
+            with torch.no_grad():
+                for t in range(t0 + 5, end_t, 5):
+                    # 一次送入所有視角，發揮最大並行算力
+                    img1_t, img2_t = raft_transforms(rgbs_tensor[:, t0].to(device), rgbs_tensor[:, t].to(device))
+                    flow = raft_model(img1_t, img2_t)[-1]
+                    flow_mag = torch.norm(flow, dim=1)
+                    max_flow_mag = torch.max(max_flow_mag, flow_mag)
             
-            if len(g_pts) > chunk_size:
-                idx = np.random.choice(len(g_pts), chunk_size, replace=False)
-                g_pts = g_pts[idx]
-                g_colors = g_colors[idx]
-                g_orig = g_orig[idx]
-                
-            sampled_pts_list.append(g_pts)
-            sampled_colors_list.append(g_colors)
-            sampled_orig_list.append(g_orig)
+            raft_model.to('cpu')
+            torch.cuda.empty_cache()
             
-        pts_sampled_np = np.concatenate(sampled_pts_list, axis=0)
-        colors_sampled_np = np.concatenate(sampled_colors_list, axis=0)
-        orig_idx_sampled_np = np.concatenate(sampled_orig_list, axis=0)
-        
-        # 如果總數還是超過 num_queries，直接截斷（因為已經照群組排好，截斷只會影響最後一組）
-        if len(pts_sampled_np) > args.num_queries:
-            pts_sampled_np = pts_sampled_np[:args.num_queries]
-            colors_sampled_np = colors_sampled_np[:args.num_queries]
-            orig_idx_sampled_np = orig_idx_sampled_np[:args.num_queries]
+            # ★ 新增：將第一台相機 (V=0) 的 RAFT Mask 疊加上去並存檔觀察
+            cam0_rgb = rgbs_tensor[0, t0].permute(1, 2, 0).cpu().numpy().astype(np.float32) # [H, W, 3]
+            cam0_mask = (max_flow_mag[0] > args.raft_threshold).cpu().numpy() # [H, W]
             
-        pts_sampled = torch.from_numpy(pts_sampled_np).to(device)
-        colors_sampled = torch.from_numpy(colors_sampled_np).to(device)
-        original_idx = torch.from_numpy(orig_idx_sampled_np).to(device)
+            overlay = cam0_rgb.copy()
+            # 將被判定為動態的區域，染上 50% 半透明的紅色 [255, 0, 0]
+            overlay[cam0_mask] = overlay[cam0_mask] * 0.5 + np.array([255, 0, 0]) * 0.5
             
-        print(f"✅ 成功提取 {len(pts_sampled)} 個初始點雲！")
+            vis_path = os.path.join(chunk_dir, f"raft_mask_overlay_t{t0}.jpg")
+            Image.fromarray(overlay.astype(np.uint8)).save(vis_path)
+            print(f"🖼️ RAFT 動態遮罩預覽圖 (半透明紅) 已儲存至: {vis_path}")
 
+            # 產生全域的 boolean motion_mask
+            motion_mask = (max_flow_mag > args.raft_threshold).flatten().cpu()
+
+        # ==========================================
+        # ★ 新增：統一的 Voxel 融合函數 (包含動態遮罩的 Max Pooling)
+        # ==========================================
+        def voxel_downsample_unified(pts, colors, orig_idx, is_dynamic, voxel_size):
+            coords = np.round(pts / voxel_size)
+            unique_coords, first_indices, inverse_indices = np.unique(coords, axis=0, return_index=True, return_inverse=True)
+            
+            num_voxels = len(unique_coords)
+            pts_sum = np.zeros((num_voxels, 3), dtype=np.float64)
+            colors_sum = np.zeros((num_voxels, 3), dtype=np.float64)
+            # 建立儲存 voxel 動態標籤的陣列 (預設為 False)
+            is_dynamic_max = np.zeros(num_voxels, dtype=bool)
+            
+            np.add.at(pts_sum, inverse_indices, pts)
+            np.add.at(colors_sum, inverse_indices, colors)
+            counts = np.bincount(inverse_indices)
+            
+            # 使用 logical_or.at 達成 Max Pooling 的效果
+            # 只要 voxel 裡有任一個點是 True(動態)，整個 voxel 就是 True
+            np.logical_or.at(is_dynamic_max, inverse_indices, is_dynamic)
+            
+            pts_voxel = (pts_sum / counts[:, None]).astype(np.float32)
+            colors_voxel = (colors_sum / counts[:, None]).astype(np.float32)
+            orig_idx_voxel = orig_idx[first_indices] 
+            
+            return pts_voxel, colors_voxel, orig_idx_voxel, is_dynamic_max
+
+        # 取出所有具備有效深度的點
+        valid_pts = pts_full[valid_mask].cpu().numpy()
+        valid_colors = colors_full[valid_mask].cpu().numpy()
+        valid_indices_np = torch.nonzero(valid_mask, as_tuple=True)[0].cpu().numpy()
+        valid_is_dynamic = motion_mask[valid_mask].numpy()
+        
+        print(f"   [Voxel 融合] 準備處理總有效點數: {len(valid_pts)}")
+        
+        # 一次性對所有點進行 Voxelize
+        v_pts, v_cols, v_idx, v_is_dyn = voxel_downsample_unified(
+            valid_pts, valid_colors, valid_indices_np, valid_is_dynamic, args.voxel_size
+        )
+        
+        print(f"   [Voxel 融合] 融合後總點數: {len(v_pts)} (voxel_size={args.voxel_size})")
+
+        # 根據 voxel 融合後的標籤，分流出動態與靜態點
+        moving_pts_np = v_pts[v_is_dyn]
+        moving_cols_np = v_cols[v_is_dyn]
+        moving_idx_np = v_idx[v_is_dyn]
+
+        static_pts_np = v_pts[~v_is_dyn]
+        static_cols_np = v_cols[~v_is_dyn]
+        static_idx_np = v_idx[~v_is_dyn]
+
+        # ==========================================
+        # ★ 新增：為動態點加回 KMeans 空間群聚排序
+        # 讓 MVTracker 的 Transformer 能完美捕捉局部運動特徵
+        # ==========================================
+        if len(moving_pts_np) > 0:
+            from sklearn.cluster import MiniBatchKMeans
+            chunk_size = args.track_chunk_size
+            # 計算需要分成幾個群 (至少 1 群)
+            num_groups = max(1, len(moving_pts_np) // chunk_size)
+            
+            print(f"   [空間分群] 將 {len(moving_pts_np)} 個動態點聚類為 {num_groups} 個空間區塊...")
+            kmeans = MiniBatchKMeans(n_clusters=num_groups, random_state=72, n_init="auto")
+            labels = kmeans.fit_predict(moving_pts_np)
+            
+            # 根據分群標籤進行排序 (argsort)
+            # 這會確保屬於同一個 Cluster 的點在陣列中是連續的
+            sort_idx = np.argsort(labels)
+            moving_pts_np = moving_pts_np[sort_idx]
+            moving_cols_np = moving_cols_np[sort_idx]
+            moving_idx_np = moving_idx_np[sort_idx]
+            print("   [空間分群] 排序完成，已為 MVTracker 最佳化 Batch 排列！")
+
+        # ==========================================
+
+        # 轉回 Torch Tensor 放進 GPU
+        moving_pts_sampled = torch.from_numpy(moving_pts_np).to(device)
+        moving_colors_sampled = torch.from_numpy(moving_cols_np).to(device)
+        moving_original_idx = torch.from_numpy(moving_idx_np).to(device)
+        
+        static_pts_sampled = torch.from_numpy(static_pts_np).to(device)
+        static_colors_sampled = torch.from_numpy(static_cols_np).to(device)
+        static_original_idx = torch.from_numpy(static_idx_np).to(device)
+
+        # 組合所有的點 (為了保持原本程式後半段能順利執行)
+        all_pts_sampled = torch.cat([moving_pts_sampled, static_pts_sampled], dim=0)
+        all_colors_sampled = torch.cat([moving_colors_sampled, static_colors_sampled], dim=0)
+        all_original_idx = torch.cat([moving_original_idx, static_original_idx], dim=0)
+            
+        print(f"✅ 成功提取 {len(moving_pts_sampled)} 動態追蹤點, {len(static_pts_sampled)} 靜態軌跡點！ (總共 {len(all_pts_sampled)} 點)")
         # 匯出初始點雲 (.ply) 供 4DGS 初始化
-        pts_np = pts_sampled.cpu().numpy()
-        colors_np = colors_sampled.cpu().numpy()
+        pts_np = all_pts_sampled.cpu().numpy()
+        colors_np = all_colors_sampled.cpu().numpy()
         if colors_np.max() <= 1.0: 
             colors_np = (colors_np * 255).astype(np.uint8)
         times_np = np.full((len(pts_np), 1), float(t0), dtype=np.float32)
@@ -274,20 +346,20 @@ def main():
         print(f"🎉 初始點雲已儲存至 {ply_path}")
 
         # ------------------------------------------
-        # 4.2 執行 MVTracker (批次處理)
+        # 4.2 執行 MVTracker (動態點批次處理)
         # ------------------------------------------
-        ts_abs = torch.full((pts_sampled.shape[0], 1), float(t0), device=pts_sampled.device)
-        query_points_abs = torch.cat([ts_abs, pts_sampled], dim=1).float()  
+        ts_abs = torch.full((all_pts_sampled.shape[0], 1), float(t0), device=all_pts_sampled.device)
+        query_points_abs = torch.cat([ts_abs, all_pts_sampled], dim=1).float()  
         
-        ts_rel = torch.full((pts_sampled.shape[0], 1), float(0), device=pts_sampled.device)
-        query_points_rel = torch.cat([ts_rel, pts_sampled], dim=1).float()
+        ts_rel = torch.full((moving_pts_sampled.shape[0], 1), float(0), device=moving_pts_sampled.device)
+        query_points_rel_moving = torch.cat([ts_rel, moving_pts_sampled], dim=1).float()
         
         all_pred_tracks = []
         all_pred_vis = []
-        total_queries = query_points_rel.shape[0]
+        total_queries = query_points_rel_moving.shape[0]
         chunk_size = args.track_chunk_size
         
-        print(f"🚀 開始追蹤 {total_queries} 個點，分批大小為 {chunk_size}...")
+        print(f"🚀 開始追蹤 {total_queries} 個動態點，分批大小為 {chunk_size}...")
         start_time = time.time()
         
         with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
@@ -297,7 +369,7 @@ def main():
             extrs_input = extrs_model[None, :, start_t:end_t].to(device)
             
             for i in tqdm(range(0, total_queries, chunk_size), desc="MVTracker 追蹤進度"):
-                batch_queries = query_points_rel[i:i+chunk_size].to(device)
+                batch_queries = query_points_rel_moving[i:i+chunk_size].to(device)
                 results = mvtracker(
                     rgbs=rgbs_input,
                     depths=depths_input,
@@ -312,9 +384,26 @@ def main():
                 torch.cuda.empty_cache()
 
         end_time = time.time()
-        pred_tracks = torch.cat(all_pred_tracks, dim=2)[0]
-        pred_vis = torch.cat(all_pred_vis, dim=2)[0]
-        print(f"✅ 追蹤完成！ (片段花費時間: {end_time - start_time:.2f} 秒)")
+        
+        if len(all_pred_tracks) > 0:
+            pred_tracks_moving = torch.cat(all_pred_tracks, dim=2)[0]
+            pred_vis_moving = torch.cat(all_pred_vis, dim=2)[0]
+        else:
+            pred_tracks_moving = torch.empty((chunk_frames, 0, 3))
+            pred_vis_moving = torch.empty((chunk_frames, 0))
+            
+        if static_pts_sampled is not None:
+            N_static = static_pts_sampled.shape[0]
+            pred_tracks_static = static_pts_sampled.unsqueeze(0).expand(chunk_frames, -1, -1).cpu()
+            pred_vis_static = torch.ones((chunk_frames, N_static), dtype=torch.float32).cpu() * 10.0
+            
+            pred_tracks = torch.cat([pred_tracks_moving, pred_tracks_static], dim=1)
+            pred_vis = torch.cat([pred_vis_moving, pred_vis_static], dim=1)
+        else:
+            pred_tracks = pred_tracks_moving
+            pred_vis = pred_vis_moving
+
+        print(f"✅ 動態追蹤與靜態軌跡合併完成！ (片段花費時間: {end_time - start_time:.2f} 秒)")
 
         # ------------------------------------------
         # 4.3 儲存軌跡
@@ -337,14 +426,17 @@ def main():
             print(f"📁 正在將每一幀的點雲匯出至 {ply_dir}...")
             
             pred_tracks_np = pred_tracks.numpy()
+            total_output_pts = len(all_pts_sampled)  # <== 修正：確保總數是動態+靜態之和
+            
             for t_rel in tqdm(range(chunk_frames), desc="匯出 PLY"):
                 abs_t = start_t + t_rel
                 ply_out_path = os.path.join(ply_dir, f"frame_{abs_t:04d}.ply")
                 
-                elements = np.empty(total_queries, dtype=dtype)
+                # <== 修正：改用 total_output_pts 初始化 elements 陣列
+                elements = np.empty(total_output_pts, dtype=dtype)
                 elements['x'], elements['y'], elements['z'] = pred_tracks_np[t_rel, :, 0], pred_tracks_np[t_rel, :, 1], pred_tracks_np[t_rel, :, 2]
                 elements['red'], elements['green'], elements['blue'] = colors_np[:, 0], colors_np[:, 1], colors_np[:, 2]
-                elements['time'] = np.full(total_queries, float(abs_t), dtype=np.float32)
+                elements['time'] = np.full(total_output_pts, float(abs_t), dtype=np.float32)
                 PlyData([PlyElement.describe(elements, 'vertex')]).write(ply_out_path)
             print("✅ 逐幀 PLY 匯出完成！")
 
@@ -352,12 +444,12 @@ def main():
         # 4.5 漂移驗證 (Drift Analysis)
         # ------------------------------------------
         print("🔍 進行漂移驗證 (Drift Analysis)...")
-        cam_idx = original_idx // (TARGET_H * TARGET_W)
-        rem = original_idx % (TARGET_H * TARGET_W)
+        cam_idx = all_original_idx // (TARGET_H * TARGET_W)
+        rem = all_original_idx % (TARGET_H * TARGET_W)
         y = rem // TARGET_W
         x = rem % TARGET_W
 
-        N_pts = len(original_idx)
+        N_pts = len(all_original_idx)
         vggt_tracks = torch.zeros((chunk_frames, N_pts, 3), device=device)
         depths_tensor_dev = depths_tensor[:, start_t:end_t].to(device)
         intrs_model_dev = intrs_model[:, start_t:end_t].to(device)
@@ -411,6 +503,7 @@ def main():
         print(f"   - VGGT      片段最後一幀平均漂移: {vggt_drift_mean[-1]:.4f} 單位")
         print(f"   - MVTracker > {threshold} 單位移動的點比例: {mv_bad_pct:.2f}%")
         print(f"   - VGGT      > {threshold} 單位移動的點比例: {vggt_bad_pct:.2f}%\n")
+        print(f"\n🎉 全部漂移分析完成！總耗時: {full_start_time - time.time():.2f} 秒")
 
 if __name__ == "__main__":
     import warnings
