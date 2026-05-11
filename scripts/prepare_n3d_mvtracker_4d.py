@@ -203,7 +203,7 @@ def main(dataset_dir, target_size=392, frames_chunk_size=1, frame_step=2):
         final_colors = final_colors[indices]
         final_times = final_times[indices]
 
-    ply_path = os.path.join(dataset_dir, "init_pointcloud_vggt_4d.ply")
+    ply_path = os.path.join(dataset_dir, "init_pointcloud_vggt_4d_b.ply")
     dtype = [
         ('x', 'f4'), ('y', 'f4'), ('z', 'f4'), 
         ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),

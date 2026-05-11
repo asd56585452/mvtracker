@@ -16,7 +16,7 @@ from torchvision.transforms.functional import to_tensor
 from tqdm import tqdm
 from plyfile import PlyData, PlyElement
 
-from mvtracker.datasets.generic_scene_dataset import _ensure_vggt_aligned_cache_and_load
+from mvtracker.datasets.generic_scene_dataset import _ensure_vggt_aligned_cache_and_load, _ensure_vggt_raw_cache_and_load
 from mvtracker.models.core.model_utils import init_pointcloud_from_rgbd
 from sklearn.cluster import MiniBatchKMeans
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
@@ -108,6 +108,7 @@ def main():
     p.add_argument("--selected_cams", type=int, nargs="+", default=[16, 10, 13, 1, 18], help="選擇的相機 ID 列表")
     p.add_argument("--track_chunk_size", type=int, default=10000, help="MVTracker 追蹤時的分批大小，避免 OOM")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
+    p.add_argument("--use_gt_cameras", action="store_true", help="使用 GT 的相機內外參，並利用 GT 縮放 VGGT 深度")
     p.add_argument("--export_per_frame_ply", action="store_true", help="是否將每一幀的軌跡儲存為獨立的 PLY 檔以供檢查")
     p.add_argument("--segment_frames", type=int, default=50, help="每個追蹤片段的長度 (幀數)")
     p.add_argument("--voxel_size", type=float, default=0.1, help="Voxel downsample 的體素大小")
@@ -184,26 +185,55 @@ def main():
     
     rgbs_tensor = torch.stack(rgbs_list) # [V, T, 3, H, W]
 
-    seq_name = "n3d_gt_init_aligned" if args.use_dynamic_vggt_cameras else "n3d_gt_init_raw"
-    print(f"🚀 提取 VGGT 深度 (模式: {seq_name})...")
-    with torch.no_grad():
-        depths_tensor, _, intrs_vggt, extrs_vggt = _ensure_vggt_aligned_cache_and_load(
-            rgbs=rgbs_tensor,
-            seq_name=seq_name,
-            dataset_root=args.dir,
-            extrs_gt=extrs_gt,
-            vggt_cache_subdir="vggt_cache",
-            skip_if_cached=False,
-            model_id="facebook/VGGT-1B",
-        )
+    if args.use_gt_cameras:
+        seq_name = "n3d_gt_init_4d"
+        print(f"🚀 提取 VGGT 深度 (模式: {seq_name}, 使用 RAW cache 並以 GT 縮放)...")
+        with torch.no_grad():
+            depths_raw, _, _, extrs_vggt = _ensure_vggt_raw_cache_and_load(
+                rgbs=rgbs_tensor,
+                seq_name=seq_name,
+                dataset_root=args.dir,
+                vggt_cache_subdir="vggt_cache",
+                skip_if_cached=False,
+                model_id="facebook/VGGT-1B",
+            )
+            
+        def get_centers(w2c_tensor):
+            homo = torch.tensor([[[0,0,0,1]]]).expand(w2c_tensor.shape[0], -1, -1).to(w2c_tensor.device)
+            c2w = torch.inverse(torch.cat([w2c_tensor, homo], dim=1))
+            return c2w[:, :3, 3]
 
-    if args.use_dynamic_vggt_cameras:
-        intrs_model = intrs_vggt
-        extrs_model = extrs_vggt
+        depths_metric = depths_raw.to(device).clone() # [V, T, 1, H, W]
+        for idx_t in range(num_frames):
+            vggt_centers = get_centers(extrs_vggt[:, idx_t].to(device))
+            gt_cent = get_centers(extrs_gt[:, 0].to(device)) 
+            scale_factor = (torch.pdist(gt_cent).mean() / (torch.pdist(vggt_centers).mean() + 1e-8)).item()
+            depths_metric[:, idx_t] *= scale_factor
+            
+        depths_tensor = depths_metric.cpu()
+        intrs_model = intrs_gt.clone()
+        extrs_model = extrs_gt.clone()
     else:
-        # 套用第1幀內外參至所有後續幀
-        intrs_model = intrs_vggt[:, 0:1].expand_as(intrs_vggt).clone()
-        extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
+        seq_name = "n3d_gt_init_aligned" if args.use_dynamic_vggt_cameras else "n3d_gt_init_raw"
+        print(f"🚀 提取 VGGT 深度 (模式: {seq_name})...")
+        with torch.no_grad():
+            depths_tensor, _, intrs_vggt, extrs_vggt = _ensure_vggt_aligned_cache_and_load(
+                rgbs=rgbs_tensor,
+                seq_name=seq_name,
+                dataset_root=args.dir,
+                extrs_gt=extrs_gt,
+                vggt_cache_subdir="vggt_cache",
+                skip_if_cached=False,
+                model_id="facebook/VGGT-1B",
+            )
+
+        if args.use_dynamic_vggt_cameras:
+            intrs_model = intrs_vggt
+            extrs_model = extrs_vggt
+        else:
+            # 套用第1幀內外參至所有後續幀
+            intrs_model = intrs_vggt[:, 0:1].expand_as(intrs_vggt).clone()
+            extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
 
     # ==========================================
     # 3. 載入模型 (MVTracker, RAFT)

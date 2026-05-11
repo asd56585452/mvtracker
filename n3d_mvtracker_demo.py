@@ -50,6 +50,7 @@ def main():
     p.add_argument("--max_frames", type=int, default=300, help="限制載入的最大幀數 (避免 MVTracker OOM)")
     p.add_argument("--num_queries", type=int, default=512, help="要追蹤的點數量")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
+    p.add_argument("--use_gt_cameras", action="store_true", help="使用 GT 的相機內外參，並利用 GT 縮放 VGGT 深度")
     p.add_argument("--mask_img", type=str, default="mask.jpg", help="提供白色像素標註追蹤點的遮罩圖片路徑 (例如: mask.png)")
     p.add_argument("--mode", type=str, choices=["viz", "full", "both", "prove"], default="viz", help="運行模式: viz(視覺化), full(抽20萬點測速), both(測速並視覺化), prove(證明點間干擾)")
     p.add_argument("--full_num_queries", type=int, default=200000, help="正式測試模式要追蹤的總點數量")
@@ -125,24 +126,41 @@ def main():
     
     rgbs_tensor = torch.stack(rgbs_list) # [V, T, 3, H, W]
 
-    if args.use_dynamic_vggt_cameras:
-        print("🚀 提取 VGGT 深度並進行全部外參對齊...")
+    if args.use_gt_cameras:
+        seq_name = "n3d_gt_init_4d"
+        print(f"🚀 提取 VGGT 深度 (模式: {seq_name}, 使用 RAW cache 並以 GT 縮放)...")
         with torch.no_grad():
-            depths_tensor, _, intrs_model, extrs_model = _ensure_vggt_aligned_cache_and_load(
+            depths_raw, _, _, extrs_vggt = _ensure_vggt_raw_cache_and_load(
                 rgbs=rgbs_tensor,
-                seq_name="n3d_gt_init_aligned",
+                seq_name=seq_name,
                 dataset_root=args.dir,
-                extrs_gt=extrs_gt,
                 vggt_cache_subdir="vggt_cache",
                 skip_if_cached=False,
                 model_id="facebook/VGGT-1B",
             )
+            
+        def get_centers(w2c_tensor):
+            homo = torch.tensor([[[0,0,0,1]]]).expand(w2c_tensor.shape[0], -1, -1).to(w2c_tensor.device)
+            c2w = torch.inverse(torch.cat([w2c_tensor, homo], dim=1))
+            return c2w[:, :3, 3]
+
+        depths_metric = depths_raw.to(device).clone() # [V, T, 1, H, W]
+        for idx_t in range(num_frames):
+            vggt_centers = get_centers(extrs_vggt[:, idx_t].to(device))
+            gt_cent = get_centers(extrs_gt[:, 0].to(device)) 
+            scale_factor = (torch.pdist(gt_cent).mean() / (torch.pdist(vggt_centers).mean() + 1e-8)).item()
+            depths_metric[:, idx_t] *= scale_factor
+            
+        depths_tensor = depths_metric.cpu()
+        intrs_model = intrs_gt.clone()
+        extrs_model = extrs_gt.clone()
     else:
-        print("🚀 提取 VGGT Raw 深度並將第1幀內外參套用至所有後續幀...")
+        seq_name = "n3d_gt_init_aligned" if args.use_dynamic_vggt_cameras else "n3d_gt_init_raw"
+        print(f"🚀 提取 VGGT 深度 (模式: {seq_name})...")
         with torch.no_grad():
             depths_tensor, _, intrs_vggt, extrs_vggt = _ensure_vggt_aligned_cache_and_load(
                 rgbs=rgbs_tensor,
-                seq_name="n3d_gt_init_raw",
+                seq_name=seq_name,
                 dataset_root=args.dir,
                 extrs_gt=extrs_gt,
                 vggt_cache_subdir="vggt_cache",
@@ -150,8 +168,13 @@ def main():
                 model_id="facebook/VGGT-1B",
             )
 
-        intrs_model = intrs_vggt[:, 0:1].expand_as(intrs_vggt).clone()
-        extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
+        if args.use_dynamic_vggt_cameras:
+            intrs_model = intrs_vggt
+            extrs_model = extrs_vggt
+        else:
+            # 套用第1幀內外參至所有後續幀
+            intrs_model = intrs_vggt[:, 0:1].expand_as(intrs_vggt).clone()
+            extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
 
     # ==========================================
     # 3. 生成隨機 Query Points (於 t0)
