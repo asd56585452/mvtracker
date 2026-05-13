@@ -434,20 +434,22 @@ def rot_z(theta):
 
     return R
 
-def align_depth_sparse_to_dense(rgbs, depths_pred, intrs_gt, extrs_gt):
+def align_depth_sparse_to_dense(rgbs, depths_pred, intrs_pred, extrs_pred, intrs_gt, extrs_gt):
     """
     rgbs: [V, T, 3, H, W] uint8 tensor
     depths_pred: [V, T, 1, H, W] float tensor
+    intrs_pred: [V, T, 3, 3] float tensor
+    extrs_pred: [V, T, 3, 4] float tensor (w2c)
     intrs_gt: [V, T, 3, 3] float tensor
     extrs_gt: [V, T, 3, 4] float tensor (w2c)
     Returns: depths_aligned [V, T, 1, H, W]
     """
     import cv2
     import numpy as np
-    from sklearn.linear_model import RANSACRegressor
+    import torch
     
     device = depths_pred.device
-    V, T, _, H, W = rgbs.shape
+    V, T, _, H_img, W_img = rgbs.shape
     
     # We only use t=0 for feature extraction and triangulation
     t_idx = 0
@@ -459,24 +461,21 @@ def align_depth_sparse_to_dense(rgbs, depths_pred, intrs_gt, extrs_gt):
     kps_all = []
     des_all = []
     
-    print("✨ [Sparse-to-Dense] 正在提取 ORB 特徵...")
+    print("✨ [SL(4) Homography] 正在提取 ORB 特徵...")
     for v in range(V):
         img = rgbs[v, t_idx].permute(1, 2, 0).cpu().numpy()
-        # Convert to BGR for cv2
         gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
         kp, des = orb.detectAndCompute(gray, None)
         kps_all.append(kp)
         des_all.append(des)
         
-    # Match between consecutive views
-    matches_all = [] # list of (v1, v2, pts1, pts2)
+    matches_all = [] 
     for v1 in range(V):
-        for v2 in range(v1 + 1, min(v1 + 3, V)): # Match with next 2 views
+        for v2 in range(v1 + 1, min(v1 + 3, V)):
             des1, des2 = des_all[v1], des_all[v2]
             if des1 is None or des2 is None or len(des1) == 0 or len(des2) == 0:
                 continue
             matches = bf.match(des1, des2)
-            # Filter matches by distance
             if len(matches) > 0:
                 dists = [m.distance for m in matches]
                 min_dist = min(dists)
@@ -486,109 +485,168 @@ def align_depth_sparse_to_dense(rgbs, depths_pred, intrs_gt, extrs_gt):
                 pts2 = np.float32([kps_all[v2][m.trainIdx].pt for m in good_matches])
                 matches_all.append((v1, v2, pts1, pts2))
 
-    points_3d_world = []
+    pts3d_gt_list = []
+    pts3d_pred_list = []
     
-    print("✨ [Sparse-to-Dense] 正在三角化真實 3D 錨點...")
-    # Triangulate
+    print("✨ [SL(4) Homography] 正在雙重三角化 (Dual Triangulation)...")
     for v1, v2, pts1, pts2 in matches_all:
-        # P = K @ [R|t]
-        K1 = intrs_gt[v1, t_idx].cpu().numpy()
-        E1 = extrs_gt[v1, t_idx].cpu().numpy() # [3, 4]
-        P1 = K1 @ E1
+        # GT projection matrices
+        K1_gt = intrs_gt[v1, t_idx].cpu().numpy()
+        E1_gt = extrs_gt[v1, t_idx].cpu().numpy()
+        P1_gt = K1_gt @ E1_gt
         
-        K2 = intrs_gt[v2, t_idx].cpu().numpy()
-        E2 = extrs_gt[v2, t_idx].cpu().numpy()
-        P2 = K2 @ E2
+        K2_gt = intrs_gt[v2, t_idx].cpu().numpy()
+        E2_gt = extrs_gt[v2, t_idx].cpu().numpy()
+        P2_gt = K2_gt @ E2_gt
         
-        pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T) # [4, N]
-        pts3d = pts4d[:3, :] / (pts4d[3, :] + 1e-8) # [3, N]
+        # Pred projection matrices
+        K1_pr = intrs_pred[v1, t_idx].cpu().numpy()
+        E1_pr = extrs_pred[v1, t_idx].cpu().numpy()
+        P1_pr = K1_pr @ E1_pr
         
-        # Filter points by positive depth and reprojection error
-        X = np.vstack([pts3d, np.ones((1, pts3d.shape[1]))]) # [4, N]
+        K2_pr = intrs_pred[v2, t_idx].cpu().numpy()
+        E2_pr = extrs_pred[v2, t_idx].cpu().numpy()
+        P2_pr = K2_pr @ E2_pr
         
-        # View 1
-        proj1 = P1 @ X
-        z1 = proj1[2, :]
-        valid1 = z1 > 0
-        u1, v_px1 = proj1[0, :] / (z1 + 1e-8), proj1[1, :] / (z1 + 1e-8)
+        # Triangulate GT
+        pts4d_gt = cv2.triangulatePoints(P1_gt, P2_gt, pts1.T, pts2.T)
+        pts3d_gt = pts4d_gt[:3, :] / (pts4d_gt[3, :] + 1e-8)
+        
+        # Triangulate Pred
+        pts4d_pr = cv2.triangulatePoints(P1_pr, P2_pr, pts1.T, pts2.T)
+        pts3d_pr = pts4d_pr[:3, :] / (pts4d_pr[3, :] + 1e-8)
+        
+        # Filter valid points
+        X_gt = np.vstack([pts3d_gt, np.ones((1, pts3d_gt.shape[1]))])
+        X_pr = np.vstack([pts3d_pr, np.ones((1, pts3d_pr.shape[1]))])
+        
+        z1_gt = (P1_gt @ X_gt)[2, :]
+        z2_gt = (P2_gt @ X_gt)[2, :]
+        z1_pr = (P1_pr @ X_pr)[2, :]
+        z2_pr = (P2_pr @ X_pr)[2, :]
+        
+        valid = (z1_gt > 0) & (z2_gt > 0) & (z1_pr > 0) & (z2_pr > 0)
+        
+        # Reprojection error filter on GT
+        proj1 = P1_gt @ X_gt
+        u1, v_px1 = proj1[0, :] / (z1_gt + 1e-8), proj1[1, :] / (z1_gt + 1e-8)
         err1 = np.linalg.norm(np.vstack([u1, v_px1]) - pts1.T, axis=0)
         
-        # View 2
-        proj2 = P2 @ X
-        z2 = proj2[2, :]
-        valid2 = z2 > 0
-        u2, v_px2 = proj2[0, :] / (z2 + 1e-8), proj2[1, :] / (z2 + 1e-8)
+        proj2 = P2_gt @ X_gt
+        u2, v_px2 = proj2[0, :] / (z2_gt + 1e-8), proj2[1, :] / (z2_gt + 1e-8)
         err2 = np.linalg.norm(np.vstack([u2, v_px2]) - pts2.T, axis=0)
         
-        valid = valid1 & valid2 & (err1 < 3.0) & (err2 < 3.0)
-        points_3d_world.append(pts3d[:, valid])
+        valid = valid & (err1 < 3.0) & (err2 < 3.0)
         
-    if len(points_3d_world) > 0:
-        points_3d_world = np.hstack(points_3d_world) # [3, Total_N]
-    else:
-        points_3d_world = np.zeros((3, 0))
+        pts3d_gt_list.append(pts3d_gt[:, valid])
+        pts3d_pred_list.append(pts3d_pr[:, valid])
         
-    print(f"🌍 成功三角化 {points_3d_world.shape[1]} 個 3D 錨點")
+    if len(pts3d_gt_list) == 0:
+        print("⚠️ 無法找到有效的 3D 匹配點，略過對齊！")
+        return depths_pred.clone()
+        
+    pts3d_gt = np.hstack(pts3d_gt_list)
+    pts3d_pred = np.hstack(pts3d_pred_list)
     
-    # Project all 3D points to all views to collect Sparse GT Depth
-    X = np.vstack([points_3d_world, np.ones((1, points_3d_world.shape[1]))])
+    print(f"🌍 獲得 {pts3d_gt.shape[1]} 對 3D 雙重錨點")
+    
+    # RANSAC for 3D DLT
+    def compute_homography_3d(pts_p, pts_g):
+        N = pts_p.shape[1]
+        A = np.zeros((3 * N, 16))
+        for i in range(N):
+            X = np.append(pts_p[:, i], 1.0)
+            x_g, y_g, z_g = pts_g[:, i]
+            A[3*i, 0:4] = -X
+            A[3*i, 12:16] = x_g * X
+            A[3*i+1, 4:8] = -X
+            A[3*i+1, 12:16] = y_g * X
+            A[3*i+2, 8:12] = -X
+            A[3*i+2, 12:16] = z_g * X
+        _, _, Vh = np.linalg.svd(A)
+        H = Vh[-1].reshape(4, 4)
+        if H[3, 3] < 0: H = -H
+        return H
+
+    print("✨ [SL(4) Homography] 執行 LMedS 解算 4x4 H 矩陣...")
+    N_pts = pts3d_pred.shape[1]
+    best_H = None
+    min_median_sq_err = float('inf')
+    best_errors = None
+    
+    for _ in range(500):
+        if N_pts < 5: break
+        idx = np.random.choice(N_pts, 5, replace=False)
+        H = compute_homography_3d(pts3d_pred[:, idx], pts3d_gt[:, idx])
+        
+        pts_p_homo = np.vstack((pts3d_pred, np.ones((1, N_pts))))
+        pts_est_homo = H @ pts_p_homo
+        pts_est = pts_est_homo[:3, :] / (pts_est_homo[3, :] + 1e-8)
+        
+        sq_errors = np.sum((pts_est - pts3d_gt)**2, axis=0)
+        median_sq_err = np.median(sq_errors)
+        
+        if median_sq_err < min_median_sq_err:
+            min_median_sq_err = median_sq_err
+            best_H = H
+            best_errors = np.sqrt(sq_errors)
+            
+    if best_H is not None:
+        # LMedS robust standard deviation estimate
+        sigma = 1.4826 * np.sqrt(min_median_sq_err)
+        # Automatic dynamic threshold based on data noise
+        dynamic_threshold = max(2.5 * sigma, 1e-4)
+        
+        best_inliers = np.where(best_errors <= dynamic_threshold)[0]
+        
+        if len(best_inliers) >= 5:
+            # Refine with all inliers using Least Squares (使用者建議)
+            best_H = compute_homography_3d(pts3d_pred[:, best_inliers], pts3d_gt[:, best_inliers])
+            print(f"🎯 成功解算 H 矩陣！(LMedS Threshold: {dynamic_threshold:.4f}, Inliers: {len(best_inliers)}/{N_pts})")
+        else:
+            print("⚠️ LMedS 後找不到足夠的 Inliers，略過對齊！")
+            return depths_pred.clone()
+    else:
+        print("⚠️ LMedS 失敗，找不到足夠的點，略過對齊！")
+        return depths_pred.clone()
+        
+    print("✨ [SL(4) Homography] 進行全局稠密點雲變換與重投影...")
+    
+    H_tensor = torch.from_numpy(best_H).float().to(device)
     
     depths_aligned = depths_pred.clone()
     
-    global_s, global_t = 1.0, 0.0
-    scales, shifts = [], []
+    # 建立網格
+    y, x = torch.meshgrid(torch.arange(H_img, device=device), torch.arange(W_img, device=device), indexing='ij')
+    pixels = torch.stack([x, y, torch.ones_like(x)], dim=-1).float() # [H, W, 3]
+    pixels = pixels.reshape(-1, 3).T # [3, H*W]
     
-    print("✨ [Sparse-to-Dense] 正在執行 RANSAC per-view Scale & Shift 解算...")
     for v in range(V):
-        K = intrs_gt[v, t_idx].cpu().numpy()
-        E = extrs_gt[v, t_idx].cpu().numpy()
-        P = K @ E
-        
-        proj = P @ X
-        Z_gt = proj[2, :]
-        u = np.round(proj[0, :] / (Z_gt + 1e-8)).astype(int)
-        v_px = np.round(proj[1, :] / (Z_gt + 1e-8)).astype(int)
-        
-        valid = (Z_gt > 0) & (u >= 0) & (u < W) & (v_px >= 0) & (v_px < H)
-        
-        if valid.sum() < 10:
-            print(f"⚠️ View {v} 有效錨點不足 ({valid.sum()})，後續將使用 Global Scale")
-            scales.append(None)
-            shifts.append(None)
-            continue
+        for t in range(T):
+            K_pr_inv = torch.inverse(intrs_pred[v, t].to(device))
+            E_pr = extrs_pred[v, t].to(device) # [3, 4]
+            R_pr_inv = E_pr[:, :3].T
+            t_pr = E_pr[:, 3]
             
-        Z_gt_valid = Z_gt[valid]
-        u_valid = u[valid]
-        v_valid = v_px[valid]
-        
-        Z_pred_valid = depths_pred[v, t_idx, 0, v_valid, u_valid].cpu().numpy()
-        
-        # RANSAC
-        ransac = RANSACRegressor(min_samples=max(2, int(len(Z_pred_valid)*0.1)), residual_threshold=0.2)
-        try:
-            ransac.fit(Z_pred_valid.reshape(-1, 1), Z_gt_valid)
-            s_v = ransac.estimator_.coef_[0]
-            t_v = ransac.estimator_.intercept_
-            print(f"🎯 View {v}: s={s_v:.4f}, t={t_v:.4f} (Inliers: {ransac.inlier_mask_.sum()}/{len(Z_pred_valid)})")
-            scales.append(s_v)
-            shifts.append(t_v)
-        except Exception as e:
-            print(f"⚠️ View {v} RANSAC 失敗: {e}")
-            scales.append(None)
-            shifts.append(None)
-
-    # Calculate global fallback
-    valid_scales = [s for s in scales if s is not None]
-    valid_shifts = [t for t in shifts if t is not None]
-    if len(valid_scales) > 0:
-        global_s = np.mean(valid_scales)
-        global_t = np.mean(valid_shifts)
-        
-    for v in range(V):
-        s_v = scales[v] if scales[v] is not None else global_s
-        t_v = shifts[v] if shifts[v] is not None else global_t
-        
-        # Apply to all frames of this view
-        depths_aligned[v, :] = (depths_pred[v, :] * s_v + t_v).clamp(min=0.01)
-        
+            d_pr = depths_pred[v, t, 0].view(-1).to(device) # [H*W]
+            
+            # Unproject to VGGT Camera space
+            rays_cam_pr = K_pr_inv @ pixels # [3, H*W]
+            pts_cam_pr = rays_cam_pr * d_pr # [3, H*W]
+            
+            # Transform to VGGT World Space
+            pts_world_pr = R_pr_inv @ (pts_cam_pr - t_pr.unsqueeze(1)) # [3, H*W]
+            
+            # Apply SL(4) Global Homography
+            pts_world_pr_homo = torch.cat([pts_world_pr, torch.ones((1, H_img*W_img), device=device)], dim=0) # [4, H*W]
+            pts_world_gt_homo = H_tensor @ pts_world_pr_homo
+            pts_world_gt = pts_world_gt_homo[:3, :] / (pts_world_gt_homo[3, :] + 1e-8) # [3, H*W]
+            
+            # Project back to GT Camera to get Z depth
+            E_gt = extrs_gt[v, t].to(device)
+            pts_cam_gt = E_gt[:, :3] @ pts_world_gt + E_gt[:, 3].unsqueeze(1) # [3, H*W]
+            
+            z_gt = pts_cam_gt[2, :].view(H_img, W_img)
+            depths_aligned[v, t, 0] = z_gt.clamp(min=0.01)
+            
     return depths_aligned

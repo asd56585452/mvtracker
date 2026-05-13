@@ -204,9 +204,9 @@ def main():
             model_id="facebook/VGGT-1B",
         )
     if args.use_gt_cameras:
-        # 透過 Sparse-to-Dense 獨立縮放每個視角的 VGGT 深度
-        print("🚀 執行 Sparse-to-Dense Depth Alignment...")
-        depths_tensor = align_depth_sparse_to_dense(rgbs_tensor, depths_tensor, intrs_gt, extrs_gt).cpu()
+        # 透過 SL(4) Global Homography 對齊 VGGT 深度與 GT 空間
+        print("🚀 執行 SL(4) Global Homography Depth Alignment...")
+        depths_tensor = align_depth_sparse_to_dense(rgbs_tensor, depths_tensor, intrs_vggt, extrs_vggt, intrs_gt, extrs_gt).cpu()
         intrs_model = intrs_gt.clone()
         extrs_model = extrs_gt.clone()
     elif args.use_dynamic_vggt_cameras:
