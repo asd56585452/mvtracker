@@ -17,6 +17,7 @@ from tqdm import tqdm
 from plyfile import PlyData, PlyElement
 
 from mvtracker.datasets.generic_scene_dataset import _ensure_vggt_aligned_cache_and_load, _ensure_vggt_raw_cache_and_load
+from mvtracker.datasets.utils import align_depth_sparse_to_dense
 from mvtracker.models.core.model_utils import init_pointcloud_from_rgbd
 from sklearn.cluster import MiniBatchKMeans
 from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
@@ -203,7 +204,9 @@ def main():
             model_id="facebook/VGGT-1B",
         )
     if args.use_gt_cameras:
-        # 透過 GT 縮放 VGGT 深度
+        # 透過 Sparse-to-Dense 獨立縮放每個視角的 VGGT 深度
+        print("🚀 執行 Sparse-to-Dense Depth Alignment...")
+        depths_tensor = align_depth_sparse_to_dense(rgbs_tensor, depths_tensor, intrs_gt, extrs_gt).cpu()
         intrs_model = intrs_gt.clone()
         extrs_model = extrs_gt.clone()
     elif args.use_dynamic_vggt_cameras:

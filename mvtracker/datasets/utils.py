@@ -433,3 +433,162 @@ def rot_z(theta):
     R = R[0:3, 0:3]
 
     return R
+
+def align_depth_sparse_to_dense(rgbs, depths_pred, intrs_gt, extrs_gt):
+    """
+    rgbs: [V, T, 3, H, W] uint8 tensor
+    depths_pred: [V, T, 1, H, W] float tensor
+    intrs_gt: [V, T, 3, 3] float tensor
+    extrs_gt: [V, T, 3, 4] float tensor (w2c)
+    Returns: depths_aligned [V, T, 1, H, W]
+    """
+    import cv2
+    import numpy as np
+    from sklearn.linear_model import RANSACRegressor
+    
+    device = depths_pred.device
+    V, T, _, H, W = rgbs.shape
+    
+    # We only use t=0 for feature extraction and triangulation
+    t_idx = 0
+    
+    # Extract ORB features
+    orb = cv2.ORB_create(nfeatures=5000)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    
+    kps_all = []
+    des_all = []
+    
+    print("✨ [Sparse-to-Dense] 正在提取 ORB 特徵...")
+    for v in range(V):
+        img = rgbs[v, t_idx].permute(1, 2, 0).cpu().numpy()
+        # Convert to BGR for cv2
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        kp, des = orb.detectAndCompute(gray, None)
+        kps_all.append(kp)
+        des_all.append(des)
+        
+    # Match between consecutive views
+    matches_all = [] # list of (v1, v2, pts1, pts2)
+    for v1 in range(V):
+        for v2 in range(v1 + 1, min(v1 + 3, V)): # Match with next 2 views
+            des1, des2 = des_all[v1], des_all[v2]
+            if des1 is None or des2 is None or len(des1) == 0 or len(des2) == 0:
+                continue
+            matches = bf.match(des1, des2)
+            # Filter matches by distance
+            if len(matches) > 0:
+                dists = [m.distance for m in matches]
+                min_dist = min(dists)
+                good_matches = [m for m in matches if m.distance <= max(2 * min_dist, 30.0)]
+                
+                pts1 = np.float32([kps_all[v1][m.queryIdx].pt for m in good_matches])
+                pts2 = np.float32([kps_all[v2][m.trainIdx].pt for m in good_matches])
+                matches_all.append((v1, v2, pts1, pts2))
+
+    points_3d_world = []
+    
+    print("✨ [Sparse-to-Dense] 正在三角化真實 3D 錨點...")
+    # Triangulate
+    for v1, v2, pts1, pts2 in matches_all:
+        # P = K @ [R|t]
+        K1 = intrs_gt[v1, t_idx].cpu().numpy()
+        E1 = extrs_gt[v1, t_idx].cpu().numpy() # [3, 4]
+        P1 = K1 @ E1
+        
+        K2 = intrs_gt[v2, t_idx].cpu().numpy()
+        E2 = extrs_gt[v2, t_idx].cpu().numpy()
+        P2 = K2 @ E2
+        
+        pts4d = cv2.triangulatePoints(P1, P2, pts1.T, pts2.T) # [4, N]
+        pts3d = pts4d[:3, :] / (pts4d[3, :] + 1e-8) # [3, N]
+        
+        # Filter points by positive depth and reprojection error
+        X = np.vstack([pts3d, np.ones((1, pts3d.shape[1]))]) # [4, N]
+        
+        # View 1
+        proj1 = P1 @ X
+        z1 = proj1[2, :]
+        valid1 = z1 > 0
+        u1, v_px1 = proj1[0, :] / (z1 + 1e-8), proj1[1, :] / (z1 + 1e-8)
+        err1 = np.linalg.norm(np.vstack([u1, v_px1]) - pts1.T, axis=0)
+        
+        # View 2
+        proj2 = P2 @ X
+        z2 = proj2[2, :]
+        valid2 = z2 > 0
+        u2, v_px2 = proj2[0, :] / (z2 + 1e-8), proj2[1, :] / (z2 + 1e-8)
+        err2 = np.linalg.norm(np.vstack([u2, v_px2]) - pts2.T, axis=0)
+        
+        valid = valid1 & valid2 & (err1 < 3.0) & (err2 < 3.0)
+        points_3d_world.append(pts3d[:, valid])
+        
+    if len(points_3d_world) > 0:
+        points_3d_world = np.hstack(points_3d_world) # [3, Total_N]
+    else:
+        points_3d_world = np.zeros((3, 0))
+        
+    print(f"🌍 成功三角化 {points_3d_world.shape[1]} 個 3D 錨點")
+    
+    # Project all 3D points to all views to collect Sparse GT Depth
+    X = np.vstack([points_3d_world, np.ones((1, points_3d_world.shape[1]))])
+    
+    depths_aligned = depths_pred.clone()
+    
+    global_s, global_t = 1.0, 0.0
+    scales, shifts = [], []
+    
+    print("✨ [Sparse-to-Dense] 正在執行 RANSAC per-view Scale & Shift 解算...")
+    for v in range(V):
+        K = intrs_gt[v, t_idx].cpu().numpy()
+        E = extrs_gt[v, t_idx].cpu().numpy()
+        P = K @ E
+        
+        proj = P @ X
+        Z_gt = proj[2, :]
+        u = np.round(proj[0, :] / (Z_gt + 1e-8)).astype(int)
+        v_px = np.round(proj[1, :] / (Z_gt + 1e-8)).astype(int)
+        
+        valid = (Z_gt > 0) & (u >= 0) & (u < W) & (v_px >= 0) & (v_px < H)
+        
+        if valid.sum() < 10:
+            print(f"⚠️ View {v} 有效錨點不足 ({valid.sum()})，後續將使用 Global Scale")
+            scales.append(None)
+            shifts.append(None)
+            continue
+            
+        Z_gt_valid = Z_gt[valid]
+        u_valid = u[valid]
+        v_valid = v_px[valid]
+        
+        Z_pred_valid = depths_pred[v, t_idx, 0, v_valid, u_valid].cpu().numpy()
+        
+        # RANSAC
+        ransac = RANSACRegressor(min_samples=max(2, int(len(Z_pred_valid)*0.1)), residual_threshold=0.2)
+        try:
+            ransac.fit(Z_pred_valid.reshape(-1, 1), Z_gt_valid)
+            s_v = ransac.estimator_.coef_[0]
+            t_v = ransac.estimator_.intercept_
+            print(f"🎯 View {v}: s={s_v:.4f}, t={t_v:.4f} (Inliers: {ransac.inlier_mask_.sum()}/{len(Z_pred_valid)})")
+            scales.append(s_v)
+            shifts.append(t_v)
+        except Exception as e:
+            print(f"⚠️ View {v} RANSAC 失敗: {e}")
+            scales.append(None)
+            shifts.append(None)
+
+    # Calculate global fallback
+    valid_scales = [s for s in scales if s is not None]
+    valid_shifts = [t for t in shifts if t is not None]
+    if len(valid_scales) > 0:
+        global_s = np.mean(valid_scales)
+        global_t = np.mean(valid_shifts)
+        
+    for v in range(V):
+        s_v = scales[v] if scales[v] is not None else global_s
+        t_v = shifts[v] if shifts[v] is not None else global_t
+        
+        # Apply to all frames of this view
+        depths_aligned[v, :] = (depths_pred[v, :] * s_v + t_v).clamp(min=0.01)
+        
+    return depths_aligned
