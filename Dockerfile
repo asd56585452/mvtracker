@@ -25,6 +25,23 @@ RUN wget -q https://raw.githubusercontent.com/ethz-vlg/mvtracker/refs/heads/main
 # 5. 編譯並安裝底層加速套件
 RUN pip install --no-cache-dir --upgrade --no-build-isolation flash-attn==2.5.8 && \
     pip install --no-cache-dir --no-build-isolation "git+https://github.com/ethz-vlg/pointcept.git@2082918#subdirectory=libs/pointops"
+ENV MAX_JOBS=1
+# 6. 安裝 Depth Anything 3 及其相依套件
+# 這裡直接從官方 GitHub clone 下來
+RUN git clone https://github.com/ByteDance-Seed/Depth-Anything-3.git /workspace/depth-anything-3
+
+WORKDIR /workspace/depth-anything-3
+
+# 安裝 DA3 的 requirements (包含 numpy<2 等必要套件)
+RUN sed -i '/xformers/d' requirements.txt && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 根據 DA3 官方建議安裝本體與 gsplat (若未來需支援 3DGS 輸出) 
+RUN sed -i '/xformers/d' pyproject.toml && \
+    pip install -e . && \
+    pip install --no-build-isolation git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70
+# 切換回主工作目錄
+WORKDIR /workspace
 
 CMD ["/bin/bash"]
 # docker run --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 -it --rm -v /home/tsaichenghan/.cache/huggingface:/root/.cache/huggingface -v /home/tsaichenghan/mvtracker:/workspace/mvtracker -p 9876:9876 mvtracker_env /bin/bash

@@ -110,6 +110,7 @@ def main():
     p.add_argument("--track_chunk_size", type=int, default=10000, help="MVTracker 追蹤時的分批大小，避免 OOM")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
     p.add_argument("--use_gt_cameras", action="store_true", help="使用 GT 的相機內外參，並利用 GT 縮放 VGGT 深度")
+    p.add_argument("--use_da3", action="store_true", help="使用 Depth Anything 3 取代 VGGT 來預測全局一致性深度")
     p.add_argument("--export_per_frame_ply", action="store_true", help="是否將每一幀的軌跡儲存為獨立的 PLY 檔以供檢查")
     p.add_argument("--segment_frames", type=int, default=50, help="每個追蹤片段的長度 (幀數)")
     p.add_argument("--voxel_size", type=float, default=0.1, help="Voxel downsample 的體素大小")
@@ -186,36 +187,72 @@ def main():
     
     rgbs_tensor = torch.stack(rgbs_list) # [V, T, 3, H, W]
 
-    if args.use_gt_cameras:
-        seq_name = "n3d_gt_init_4d"
-    elif args.use_dynamic_vggt_cameras:
-        seq_name = "n3d_gt_init_aligned"
-    else:
-        seq_name = "n3d_gt_init_raw"
-    print(f"🚀 提取 VGGT 深度 (模式: {seq_name})...")
-    with torch.no_grad():
-        depths_tensor, _, intrs_vggt, extrs_vggt = _ensure_vggt_aligned_cache_and_load(
-            rgbs=rgbs_tensor,
-            seq_name=seq_name,
-            dataset_root=args.dir,
-            extrs_gt=extrs_gt,
-            vggt_cache_subdir="vggt_cache",
-            skip_if_cached=False,
-            model_id="facebook/VGGT-1B",
-        )
-    if args.use_gt_cameras:
-        # 透過 SL(4) Global Homography 對齊 VGGT 深度與 GT 空間
-        print("🚀 執行 SL(4) Global Homography Depth Alignment...")
-        depths_tensor = align_depth_sparse_to_dense(rgbs_tensor, depths_tensor, intrs_vggt, extrs_vggt, intrs_gt, extrs_gt).cpu()
+    if args.use_da3:
+        # ==========================================
+        # [路徑 A] 使用 Depth Anything 3 (DA3)
+        # ==========================================
+        from mvtracker.datasets.generic_scene_dataset import _ensure_da3_aligned_cache_and_load
+        print(f"🚀 提取 DA3 深度 (帶有 GT 位姿約束)...")
+        with torch.no_grad():
+            depths_tensor, _, intrs_model, extrs_model = _ensure_da3_aligned_cache_and_load(
+                rgbs=rgbs_tensor,
+                seq_name="n3d_da3_aligned",
+                dataset_root=args.dir,
+                extrs_gt=extrs_gt,
+                intrs_gt=intrs_gt,
+                skip_if_cached=False, # 記得重新提取一次
+            )
+            
+        # 🌟【關鍵修復】補齊真實世界尺度！
+        # DA3 確保了多視角一致性，但仍需要靠稀疏點雲(或 GT)來求得絕對的 Scale 和 Shift
+        print("🚀 執行 Global Homography Depth Alignment 補齊 DA3 真實尺度...")
+        depths_tensor = align_depth_sparse_to_dense(
+            rgbs_tensor, 
+            depths_tensor, 
+            intrs_model, 
+            extrs_model, 
+            intrs_gt, 
+            extrs_gt
+        ).cpu()
+        
+        # 對齊後，相機模型即為 GT
         intrs_model = intrs_gt.clone()
         extrs_model = extrs_gt.clone()
-    elif args.use_dynamic_vggt_cameras:
-        intrs_model = intrs_vggt
-        extrs_model = extrs_vggt
     else:
-        # 套用第1幀內外參至所有後續幀
-        intrs_model = intrs_vggt[:, 0:1].expand_as(intrs_vggt).clone()
-        extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
+        # ==========================================
+        # [路徑 B] 使用原始的 VGGT
+        # ==========================================
+        if args.use_gt_cameras:
+            seq_name = "n3d_gt_init_4d"
+        elif args.use_dynamic_vggt_cameras:
+            seq_name = "n3d_gt_init_aligned"
+        else:
+            seq_name = "n3d_gt_init_raw"
+            
+        print(f"🚀 提取 VGGT 深度 (模式: {seq_name})...")
+        with torch.no_grad():
+            depths_tensor, _, intrs_vggt, extrs_vggt = _ensure_vggt_aligned_cache_and_load(
+                rgbs=rgbs_tensor,
+                seq_name=seq_name,
+                dataset_root=args.dir,
+                extrs_gt=extrs_gt,
+                vggt_cache_subdir="vggt_cache",
+                skip_if_cached=False,
+                model_id="facebook/VGGT-1B",
+            )
+        if args.use_gt_cameras:
+            # 透過 SL(4) Global Homography 對齊 VGGT 深度與 GT 空間
+            print("🚀 執行 SL(4) Global Homography Depth Alignment...")
+            depths_tensor = align_depth_sparse_to_dense(rgbs_tensor, depths_tensor, intrs_vggt, extrs_vggt, intrs_gt, extrs_gt).cpu()
+            intrs_model = intrs_gt.clone()
+            extrs_model = extrs_gt.clone()
+        elif args.use_dynamic_vggt_cameras:
+            intrs_model = intrs_vggt
+            extrs_model = extrs_vggt
+        else:
+            # 套用第1幀內外參至所有後續幀
+            intrs_model = intrs_vggt[:, 0:1].expand_as(intrs_vggt).clone()
+            extrs_model = extrs_vggt[:, 0:1].expand_as(extrs_vggt).clone()
 
     # ==========================================
     # 3. 載入模型 (MVTracker, RAFT)

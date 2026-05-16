@@ -1,6 +1,6 @@
 services:
   mvtracker:
-    image: asdggg/mvtracker_env:latest
+    image: asdggg/mvtracker_env:da3
     container_name: mvtracker_container
 
     working_dir: /workspace/mvtracker

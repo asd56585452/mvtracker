@@ -943,3 +943,88 @@ def _ensure_vggt_aligned_cache_and_load(
     # np.save(f_extr_aln, extr_aln.numpy())
 
     return depths_aln.unsqueeze(2), confs_raw, intr_aln, extr_aln
+
+def _ensure_da3_aligned_cache_and_load(
+        rgbs: torch.Tensor,  # uint8 [V,T,3,H,W]
+        seq_name: str,
+        dataset_root: str,
+        extrs_gt: torch.Tensor,  # [V,T,3,4] GT world->cam
+        intrs_gt: torch.Tensor,  # [V,T,3,3] GT intrinsics
+        da3_cache_subdir: str = "da3_cache",
+        skip_if_cached: bool = True,
+        model_id: str = "depth-anything/DA3-LARGE-1.1",
+):
+    """
+    執行 DA3 並快取預測結果。
+    由於 DA3 直接接收 GT 內外參作為條件提示，其輸出的深度圖已自帶 Metric Scale，
+    因此不需要像 VGGT 那樣進行 Umeyama 或 SL(4) 對齊。
+    Returns CPU float32 tensors:
+      depths       [V,T,1,H,W]
+      confs        [V,T,1,H,W]  (常數 100)
+      intrs_gt     [V,T,3,3]    (直接回傳 GT)
+      extrs_gt     [V,T,3,4]    (直接回傳 GT)
+    """
+    import gc
+    
+    V, T, _, H, W = rgbs.shape
+    cache_root = os.path.join(dataset_root, da3_cache_subdir, seq_name)
+    os.makedirs(cache_root, exist_ok=True)
+
+    f_depths = os.path.join(cache_root, "da3_depths.npy")
+
+    if skip_if_cached and os.path.isfile(f_depths):
+        depths = torch.from_numpy(np.load(f_depths)).float().unsqueeze(2)
+        confs = torch.full_like(depths, 100.0)
+        return depths, confs, intrs_gt.clone(), extrs_gt.clone()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_dtype = torch.bfloat16 if (
+            device.type == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+
+    # 動態載入 DA3，避免在沒有安裝 DA3 的環境下報錯
+    from depth_anything_3.api import DepthAnything3
+    model = DepthAnything3.from_pretrained(model_id).to(device)
+    model.eval()
+
+    depths_arr = torch.empty((V, T, H, W), dtype=torch.float32)
+
+    with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype):
+        for t in tqdm(range(T), desc=f"DA3 Inference {seq_name}", unit="f"):
+            # 將 RGB 轉換為 DA3 預期的 list of numpy arrays (H, W, 3)
+            images_t = [rgbs[v, t].permute(1, 2, 0).cpu().numpy() for v in range(V)]
+            
+            extr_t = extrs_gt[:, t].cpu().numpy() # [V, 3, 4]
+            intr_t = intrs_gt[:, t].cpu().numpy() # [V, 3, 3]
+
+            extr_4x4 = np.zeros((V, 4, 4), dtype=np.float32)
+            extr_4x4[:, :3, :4] = extr_t
+            extr_4x4[:, 3, 3] = 1.0
+
+            pred = model.inference(
+                images_t, 
+                extrinsics=extr_4x4, 
+                intrinsics=intr_t
+            )
+            
+            pred_depth_tensor = torch.from_numpy(pred.depth).unsqueeze(1) # 變成 [V, 1, H_out, W_out]
+            
+            pred_depth_resized = F.interpolate(
+                pred_depth_tensor, 
+                size=(H, W), 
+                mode='bilinear', 
+                align_corners=False
+            ).squeeze(1) # 轉回 [V, H, W]
+            
+            # 存入結果陣列
+            depths_arr[:, t] = pred_depth_resized
+
+    # 儲存快取
+    # np.save(f_depths, depths_arr.numpy())
+
+    # 釋放記憶體給後續的 MVTracker
+    del model
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    confs_arr = torch.full((V, T, H, W), 100.0, dtype=torch.float32)
+    return depths_arr.unsqueeze(2), confs_arr.unsqueeze(2), intrs_gt.clone(), extrs_gt.clone()
