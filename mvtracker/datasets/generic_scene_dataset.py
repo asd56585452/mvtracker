@@ -1003,7 +1003,11 @@ def _ensure_da3_aligned_cache_and_load(
             pred = model.inference(
                 images_t, 
                 extrinsics=extr_4x4, 
-                intrinsics=intr_t
+                intrinsics=intr_t,
+                process_res=784,              # 在 VRAM 允許下適度提升
+                use_ray_pose=True,           # 加強幾何約束
+                align_to_input_ext_scale=True,
+                ref_view_strategy="all_to_all" # 確保一致性
             )
             
             pred_depth_tensor = torch.from_numpy(pred.depth).unsqueeze(1) # 變成 [V, 1, H_out, W_out]
@@ -1011,7 +1015,7 @@ def _ensure_da3_aligned_cache_and_load(
             pred_depth_resized = F.interpolate(
                 pred_depth_tensor, 
                 size=(H, W), 
-                mode='bilinear', 
+                mode='bicubic', 
                 align_corners=False
             ).squeeze(1) # 轉回 [V, H, W]
             

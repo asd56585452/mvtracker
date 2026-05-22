@@ -205,15 +205,15 @@ def main():
             
         # 🌟【關鍵修復】補齊真實世界尺度！
         # DA3 確保了多視角一致性，但仍需要靠稀疏點雲(或 GT)來求得絕對的 Scale 和 Shift
-        print("🚀 執行 Global Homography Depth Alignment 補齊 DA3 真實尺度...")
-        depths_tensor = align_depth_sparse_to_dense(
-            rgbs_tensor, 
-            depths_tensor, 
-            intrs_model, 
-            extrs_model, 
-            intrs_gt, 
-            extrs_gt
-        ).cpu()
+        # print("🚀 執行 Global Homography Depth Alignment 補齊 DA3 真實尺度...")
+        # depths_tensor = align_depth_sparse_to_dense(
+        #     rgbs_tensor, 
+        #     depths_tensor, 
+        #     intrs_model, 
+        #     extrs_model, 
+        #     intrs_gt, 
+        #     extrs_gt
+        # ).cpu()
         
         # 對齊後，相機模型即為 GT
         intrs_model = intrs_gt.clone()
