@@ -1004,8 +1004,7 @@ def _ensure_da3_aligned_cache_and_load(
                 images_t, 
                 extrinsics=extr_4x4, 
                 intrinsics=intr_t,
-                process_res=784,              # 在 VRAM 允許下適度提升
-                use_ray_pose=True,           # 加強幾何約束
+                process_res=560,              # 在 VRAM 允許下適度提升
                 align_to_input_ext_scale=True,
                 ref_view_strategy="all_to_all" # 確保一致性
             )
@@ -1015,8 +1014,7 @@ def _ensure_da3_aligned_cache_and_load(
             pred_depth_resized = F.interpolate(
                 pred_depth_tensor, 
                 size=(H, W), 
-                mode='bicubic', 
-                align_corners=False
+                mode='nearest'
             ).squeeze(1) # 轉回 [V, H, W]
             
             # 存入結果陣列

@@ -21,6 +21,7 @@ services:
     # 對應 -v 的掛載路徑
     volumes:
       - /home/tsaichenghan/.cache:/root/.cache
+      - /home/tsaichenghan/.cache:/home/ubuntu/.cache
       - /home/tsaichenghan/mvtracker:/workspace/mvtracker
 
     # 【超級大禮包】直接幫你把預防 VRAM 碎片的環境變數寫死在這裡！

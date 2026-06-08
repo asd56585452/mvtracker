@@ -450,7 +450,7 @@ def main():
         log_rgb_pointcloud=True,
     )
     
-    if args.use_gt_cameras:
+    if args.use_gt_cameras and not args.use_da3:
         print("📷 正在 Rerun 同時視覺化 VGGT 預測相機...")
         for v in range(V):
             for t in range(num_frames):
