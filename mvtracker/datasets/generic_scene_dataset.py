@@ -953,6 +953,7 @@ def _ensure_da3_aligned_cache_and_load(
         da3_cache_subdir: str = "da3_cache",
         skip_if_cached: bool = True,
         model_id: str = "depth-anything/DA3-LARGE-1.1",
+        temporal_chunk_size: int = 3,
 ):
     """
     執行 DA3 並快取預測結果。
@@ -989,36 +990,50 @@ def _ensure_da3_aligned_cache_and_load(
     depths_arr = torch.empty((V, T, H, W), dtype=torch.float32)
 
     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype):
-        for t in tqdm(range(T), desc=f"DA3 Inference {seq_name}", unit="f"):
-            # 將 RGB 轉換為 DA3 預期的 list of numpy arrays (H, W, 3)
-            images_t = [rgbs[v, t].permute(1, 2, 0).cpu().numpy() for v in range(V)]
+        for t_start in tqdm(range(0, T, temporal_chunk_size), desc=f"DA3 Inference {seq_name}", unit="chunk"):
+            t_end = min(t_start + temporal_chunk_size, T)
+            curr_chunk_size = t_end - t_start
             
-            extr_t = extrs_gt[:, t].cpu().numpy() # [V, 3, 4]
-            intr_t = intrs_gt[:, t].cpu().numpy() # [V, 3, 3]
+            # 收集該 chunk 下所有幀、所有視角的影像與相機內外參
+            images_chunk = []
+            extr_list = []
+            intr_list = []
+            for t in range(t_start, t_end):
+                for v in range(V):
+                    images_chunk.append(rgbs[v, t].permute(1, 2, 0).cpu().numpy())
+                    extr_list.append(extrs_gt[v, t].cpu().numpy())
+                    intr_list.append(intrs_gt[v, t].cpu().numpy())
+            
+            extr_chunk = np.stack(extr_list, axis=0) # [V * curr_chunk_size, 3, 4]
+            intr_chunk = np.stack(intr_list, axis=0) # [V * curr_chunk_size, 3, 3]
 
-            extr_4x4 = np.zeros((V, 4, 4), dtype=np.float32)
-            extr_4x4[:, :3, :4] = extr_t
+            extr_4x4 = np.zeros((V * curr_chunk_size, 4, 4), dtype=np.float32)
+            extr_4x4[:, :3, :4] = extr_chunk
             extr_4x4[:, 3, 3] = 1.0
 
             pred = model.inference(
-                images_t, 
+                images_chunk, 
                 extrinsics=extr_4x4, 
-                intrinsics=intr_t,
+                intrinsics=intr_chunk,
                 process_res=560,              # 在 VRAM 允許下適度提升
                 align_to_input_ext_scale=True,
-                ref_view_strategy="all_to_all" # 確保一致性
+                ref_view_strategy="saddle_balanced" 
             )
             
-            pred_depth_tensor = torch.from_numpy(pred.depth).unsqueeze(1) # 變成 [V, 1, H_out, W_out]
+            pred_depth_tensor = torch.from_numpy(pred.depth).unsqueeze(1) # [V * curr_chunk_size, 1, H_out, W_out]
             
             pred_depth_resized = F.interpolate(
                 pred_depth_tensor, 
                 size=(H, W), 
                 mode='nearest'
-            ).squeeze(1) # 轉回 [V, H, W]
+            ).squeeze(1) # [V * curr_chunk_size, H, W]
             
-            # 存入結果陣列
-            depths_arr[:, t] = pred_depth_resized
+            # 存回結果陣列
+            idx = 0
+            for t in range(t_start, t_end):
+                for v in range(V):
+                    depths_arr[v, t] = pred_depth_resized[idx]
+                    idx += 1
 
     # 儲存快取
     # np.save(f_depths, depths_arr.numpy())

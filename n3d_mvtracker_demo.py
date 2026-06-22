@@ -60,6 +60,7 @@ def main():
     p.add_argument("--lightweight", action="store_true", help="使用輕量級視覺化 (適合網頁版 Viewer)")
     p.add_argument("--rrd", default="n3d_mvtracker_demo.rrd", help="輸出的 Rerun 檔名")
     p.add_argument("--start_frame", type=int, default=0, help="開始追蹤的幀數 (設定 t0)")
+    p.add_argument("--da3_chunk_size", type=int, default=3, help="DA3 跨時間處理的 chunk size (大於 1 時可提供跨時間/幀的一致性)")
     args = p.parse_args()
 
     np.random.seed(72)
@@ -142,6 +143,7 @@ def main():
                 extrs_gt=extrs_gt,
                 intrs_gt=intrs_gt,
                 skip_if_cached=False, # 記得重新提取一次
+                temporal_chunk_size=args.da3_chunk_size,
             )
             
         # 🌟【關鍵修復】補齊真實世界尺度！

@@ -118,6 +118,7 @@ def main():
     p.add_argument("--raft_threshold", type=float, default=1.0, help="RAFT 判定為移動的像素閾值")
     p.add_argument("--query_sort_mode", type=str, default="round_robin", help="query 排序方式: round_robin 或 kmeans")
     p.add_argument("--export_vggt_all_frame_ply", action="store_true", help="將VGGT每幀重建結果合併成完整的4D點雲供比對")
+    p.add_argument("--da3_chunk_size", type=int, default=3, help="DA3 跨時間處理的 chunk size (大於 1 時可提供跨時間/幀的一致性)")
     args = p.parse_args()
 
     np.random.seed(72)
@@ -201,6 +202,7 @@ def main():
                 extrs_gt=extrs_gt,
                 intrs_gt=intrs_gt,
                 skip_if_cached=False, # 記得重新提取一次
+                temporal_chunk_size=args.da3_chunk_size,
             )
             
         # 🌟【關鍵修復】補齊真實世界尺度！
