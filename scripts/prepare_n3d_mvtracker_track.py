@@ -101,13 +101,132 @@ def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
     w2c_cv = np.linalg.inv(c2w_cv)[:3, :4]
     return w2c_cv, K
 
+def voxel_downsample_unified(pts, colors, is_dynamic, voxel_size, footprints=None, min_voxel_size=0.02, scale=2.0):
+    """
+    統一的 Voxel 融合下採樣函數。
+    - 若 footprints 為 None，則執行標準的均勻體素化 (Uniform Voxelization)。
+    - 若 footprints 不為 None，則根據各點的相機反投影像素足跡計算動態體素大小，
+      並實施「解析度優先級過濾 (Resolution Prioritization)」，避免遠景粗糙點污染近景高精細點的解析度。
+    """
+    if footprints is not None:
+        # 1. 計算每個點的理想 Voxel 大小
+        target_s = footprints * scale
+        target_s = np.clip(target_s, min_voxel_size, voxel_size)
+        
+        # 2. 將 Voxel 大小以 min_voxel_size 為基礎，離散化量化至 2 的次方等級 (e.g. 0.02, 0.04, 0.08...)
+        k = np.round(np.log2(target_s / min_voxel_size))
+        k = np.clip(k, 0, None).astype(np.int32)
+        s_i = min_voxel_size * (2 ** k)
+        s_i = np.clip(s_i, min_voxel_size, voxel_size)
+        
+        # 3. 找出所有獨特的 Voxel 尺寸，並由小到大排序 (解析度最高優先)
+        unique_s = np.sort(np.unique(s_i))
+        
+        downsampled_pts_list = []
+        downsampled_colors_list = []
+        downsampled_is_dyn_list = []
+        
+        # 建立記錄已被細網格佔用的雜湊集合 (以 min_voxel_size 換算整數坐標)
+        occupied_keys = set()
+        
+        for s in unique_s:
+            # 找到屬於當前體素大小等級的所有點
+            mask = (s_i == s)
+            pts_sub = pts[mask]
+            colors_sub = colors[mask]
+            is_dyn_sub = is_dynamic[mask] if is_dynamic is not None else None
+            
+            if len(pts_sub) == 0:
+                continue
+                
+            # 4. 對當前等級的點進行細網格佔用過濾 (捨棄落在已佔用高解析度區域的粗點)
+            if s > min_voxel_size and len(occupied_keys) > 0:
+                # 換算為細網格 (min_voxel_size) 下的整數索引
+                fine_coords = np.round(pts_sub / min_voxel_size).astype(np.int64)
+                keep_mask = []
+                for coord in fine_coords:
+                    tup_coord = (coord[0], coord[1], coord[2])
+                    keep_mask.append(tup_coord not in occupied_keys)
+                keep_mask = np.array(keep_mask)
+                
+                # 僅保留未被佔用的點
+                pts_sub = pts_sub[keep_mask]
+                colors_sub = colors_sub[keep_mask]
+                if is_dyn_sub is not None:
+                    is_dyn_sub = is_dyn_sub[keep_mask]
+                    
+                if len(pts_sub) == 0:
+                    continue
+            
+            # 5. 使用體素大小 s 進行局部體素化
+            coords = np.round(pts_sub / s)
+            unique_coords, first_indices, inverse_indices = np.unique(
+                coords, axis=0, return_index=True, return_inverse=True
+            )
+            
+            num_voxels = len(unique_coords)
+            pts_sum = np.zeros((num_voxels, 3), dtype=np.float64)
+            colors_sum = np.zeros((num_voxels, 3), dtype=np.float64)
+            
+            np.add.at(pts_sum, inverse_indices, pts_sub)
+            np.add.at(colors_sum, inverse_indices, colors_sub)
+            counts = np.bincount(inverse_indices)
+            
+            pts_voxel = (pts_sum / counts[:, None]).astype(np.float32)
+            colors_voxel = (colors_sum / counts[:, None]).astype(np.float32)
+            
+            if is_dyn_sub is not None:
+                is_dynamic_max = np.zeros(num_voxels, dtype=bool)
+                np.logical_or.at(is_dynamic_max, inverse_indices, is_dyn_sub)
+            else:
+                is_dynamic_max = None
+            
+            downsampled_pts_list.append(pts_voxel)
+            downsampled_colors_list.append(colors_voxel)
+            if is_dynamic_max is not None:
+                downsampled_is_dyn_list.append(is_dynamic_max)
+                
+            # 6. 將融合後的點登記至佔用表 (同樣以 min_voxel_size 換算)
+            fine_coords_voxel = np.round(pts_voxel / min_voxel_size).astype(np.int64)
+            for coord in fine_coords_voxel:
+                occupied_keys.add((coord[0], coord[1], coord[2]))
+                
+        out_pts = np.concatenate(downsampled_pts_list, axis=0)
+        out_colors = np.concatenate(downsampled_colors_list, axis=0)
+        out_is_dyn = np.concatenate(downsampled_is_dyn_list, axis=0) if len(downsampled_is_dyn_list) > 0 else None
+        
+        return out_pts, out_colors, out_is_dyn
+    else:
+        # 原有的均勻體素下採樣 (Uniform Voxelization)
+        coords = np.round(pts / voxel_size)
+        unique_coords, first_indices, inverse_indices = np.unique(coords, axis=0, return_index=True, return_inverse=True)
+        
+        num_voxels = len(unique_coords)
+        pts_sum = np.zeros((num_voxels, 3), dtype=np.float64)
+        colors_sum = np.zeros((num_voxels, 3), dtype=np.float64)
+        
+        np.add.at(pts_sum, inverse_indices, pts)
+        np.add.at(colors_sum, inverse_indices, colors)
+        counts = np.bincount(inverse_indices)
+        
+        if is_dynamic is not None:
+            is_dynamic_max = np.zeros(num_voxels, dtype=bool)
+            np.logical_or.at(is_dynamic_max, inverse_indices, is_dynamic)
+        else:
+            is_dynamic_max = None
+        
+        pts_voxel = (pts_sum / counts[:, None]).astype(np.float32)
+        colors_voxel = (colors_sum / counts[:, None]).astype(np.float32)
+        
+        return pts_voxel, colors_voxel, is_dynamic_max
+
 def main():
     full_start_time = time.time()
     p = argparse.ArgumentParser()
     p.add_argument("--dir", type=str, required=True, help="n3d 資料集路徑")
     p.add_argument("--max_frames", type=int, default=300, help="限制載入的最大幀數 (避免 MVTracker OOM)")
     p.add_argument("--selected_cams", type=int, nargs="+", default=[16, 10, 13, 1, 18], help="選擇的相機 ID 列表")
-    p.add_argument("--track_chunk_size", type=int, default=10000, help="MVTracker 追蹤時的分批大小，避免 OOM")
+    p.add_argument("--track_chunk_size", type=int, default=4096, help="MVTracker 追蹤時的分批大小，避免 OOM")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
     p.add_argument("--use_gt_cameras", action="store_true", help="使用 GT 的相機內外參，並利用 GT 縮放 VGGT 深度")
     p.add_argument("--use_da3", action="store_true", help="使用 Depth Anything 3 取代 VGGT 來預測全局一致性深度")
@@ -119,6 +238,9 @@ def main():
     p.add_argument("--query_sort_mode", type=str, default="round_robin", help="query 排序方式: round_robin 或 kmeans")
     p.add_argument("--export_vggt_all_frame_ply", action="store_true", help="將VGGT每幀重建結果合併成完整的4D點雲供比對")
     p.add_argument("--da3_chunk_size", type=int, default=3, help="DA3 跨時間處理的 chunk size (大於 1 時可提供跨時間/幀的一致性)")
+    p.add_argument("--use_dynamic_voxel", action="store_true", help="是否根據相機反投影像素足跡啟用動態體素下採樣")
+    p.add_argument("--min_voxel_size", type=float, default=0.02, help="動態體素下採樣的最小體素大小 (近處物體解析度)")
+    p.add_argument("--dynamic_voxel_scale", type=float, default=1.0, help="投影 Footprint 乘上的 scale 係數，用來調節動態 Voxel 大小")
     args = p.parse_args()
 
     np.random.seed(72)
@@ -340,34 +462,16 @@ def main():
             # 產生全域的 boolean motion_mask
             motion_mask = (max_flow_mag > args.raft_threshold).flatten().cpu()
 
-        # ==========================================
-        # ★ 新增：統一的 Voxel 融合函數 (包含動態遮罩的 Max Pooling)
-        # ==========================================
-        def voxel_downsample_unified(pts, colors, is_dynamic, voxel_size):
-            coords = np.round(pts / voxel_size)
-            unique_coords, first_indices, inverse_indices = np.unique(coords, axis=0, return_index=True, return_inverse=True)
-            
-            num_voxels = len(unique_coords)
-            pts_sum = np.zeros((num_voxels, 3), dtype=np.float64)
-            colors_sum = np.zeros((num_voxels, 3), dtype=np.float64)
-            # 建立儲存 voxel 動態標籤的陣列 (預設為 False)
-            
-            np.add.at(pts_sum, inverse_indices, pts)
-            np.add.at(colors_sum, inverse_indices, colors)
-            counts = np.bincount(inverse_indices)
-            
-            # 使用 logical_or.at 達成 Max Pooling 的效果
-            # 只要 voxel 裡有任一個點是 True(動態)，整個 voxel 就是 True
-            if is_dynamic is not None:
-                is_dynamic_max = np.zeros(num_voxels, dtype=bool)
-                np.logical_or.at(is_dynamic_max, inverse_indices, is_dynamic)
-            else:
-                is_dynamic_max = None
-            
-            pts_voxel = (pts_sum / counts[:, None]).astype(np.float32)
-            colors_voxel = (colors_sum / counts[:, None]).astype(np.float32)
-            
-            return pts_voxel, colors_voxel, is_dynamic_max
+        # 計算相機像素的 3D 足跡 (Footprints)
+        if args.use_dynamic_voxel:
+            focal_lengths = 0.5 * (intrs_model[:, t0, 0, 0] + intrs_model[:, t0, 1, 1])  # [V]
+            f_map = focal_lengths[:, None, None].expand(V, TARGET_H, TARGET_W)  # [V, H, W]
+            depths_t0 = depths_tensor[:, t0, 0]  # [V, H, W]
+            footprint_map = depths_t0 / f_map  # [V, H, W]
+            footprints_full = footprint_map.flatten()  # [V * H * W]
+            valid_footprints = footprints_full[valid_mask].cpu().numpy()
+        else:
+            valid_footprints = None
 
         # 取出所有具備有效深度的點
         valid_pts = pts_full[valid_mask].cpu().numpy()
@@ -378,7 +482,10 @@ def main():
         
         # 一次性對所有點進行 Voxelize
         v_pts, v_cols, v_is_dyn = voxel_downsample_unified(
-            valid_pts, valid_colors, valid_is_dynamic, args.voxel_size
+            valid_pts, valid_colors, valid_is_dynamic, args.voxel_size,
+            footprints=valid_footprints,
+            min_voxel_size=args.min_voxel_size,
+            scale=args.dynamic_voxel_scale
         )
         
         print(f"   [Voxel 融合] 融合後總點數: {len(v_pts)} (voxel_size={args.voxel_size})")
@@ -480,11 +587,24 @@ def main():
                 pts_t = xyz_t[0].cpu().numpy()
                 colors_t = rgb_t[0].cpu().numpy()
                 valid_mask_t = depths_tensor[:, t_idx, 0].flatten().cpu().numpy() > 0
-                
                 valid_pts_t = pts_t[valid_mask_t]
                 valid_colors_t = colors_t[valid_mask_t]
+                if args.use_dynamic_voxel:
+                    focal_lengths = 0.5 * (intrs_model[:, t_idx, 0, 0] + intrs_model[:, t_idx, 1, 1])  # [V]
+                    f_map = focal_lengths[:, None, None].expand(V, TARGET_H, TARGET_W)  # [V, H, W]
+                    depths_t = depths_tensor[:, t_idx, 0]  # [V, H, W]
+                    footprint_map = depths_t / f_map  # [V, H, W]
+                    footprints_full = footprint_map.flatten()  # [V * H * W]
+                    valid_footprints_t = footprints_full[valid_mask_t].cpu().numpy()
+                else:
+                    valid_footprints_t = None
                 
-                downsampled_pts, downsampled_colors, _ = voxel_downsample_unified(valid_pts_t, valid_colors_t, None, args.voxel_size)
+                downsampled_pts, downsampled_colors, _ = voxel_downsample_unified(
+                    valid_pts_t, valid_colors_t, None, args.voxel_size,
+                    footprints=valid_footprints_t,
+                    min_voxel_size=args.min_voxel_size,
+                    scale=args.dynamic_voxel_scale
+                )
                 
                 times_t = np.full((len(downsampled_pts),), float(t_idx), dtype=np.float32)
                 
