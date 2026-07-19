@@ -241,6 +241,7 @@ def main():
     p.add_argument("--use_dynamic_voxel", action="store_true", help="是否根據相機反投影像素足跡啟用動態體素下採樣")
     p.add_argument("--min_voxel_size", type=float, default=0.02, help="動態體素下採樣的最小體素大小 (近處物體解析度)")
     p.add_argument("--dynamic_voxel_scale", type=float, default=1.0, help="投影 Footprint 乘上的 scale 係數，用來調節動態 Voxel 大小")
+    p.add_argument("--skip_mvtracker", action="store_true", help="跳過 MVTracker 載入與追蹤，僅進行資料準備與點雲匯出")
     args = p.parse_args()
 
     np.random.seed(72)
@@ -381,10 +382,11 @@ def main():
     # ==========================================
     # 3. 載入模型 (MVTracker, RAFT)
     # ==========================================
-    print("🧠 載入 MVTracker...")
-    mvtracker = torch.hub.load(".", "mvtracker", source="local", pretrained=True, device=device)
-    torch.set_float32_matmul_precision("high")
-    amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+    if not args.skip_mvtracker:
+        print("🧠 載入 MVTracker...")
+        mvtracker = torch.hub.load(".", "mvtracker", source="local", pretrained=True, device=device)
+        torch.set_float32_matmul_precision("high")
+        amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
 
     raft_model = None
     raft_transforms = None
@@ -628,6 +630,9 @@ def main():
             PlyData([PlyElement.describe(elements_full, 'vertex')]).write(full_ply_path)
             print(f"🎉 全幀 4D 點雲已儲存至: {full_ply_path} (總點數: {len(full_pts_np)})\n")
 
+        if args.skip_mvtracker:
+            print(f"⏭️ 啟用 --skip_mvtracker，跳過該片段的 MVTracker 追蹤與後續步驟。")
+            continue
 
         # ------------------------------------------
         # 4.2 執行 MVTracker (動態點批次處理)
