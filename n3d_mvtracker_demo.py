@@ -18,6 +18,15 @@ from mvtracker.models.core.model_utils import init_pointcloud_from_rgbd
 from mvtracker.utils.visualizer_rerun import log_pointclouds_to_rerun, log_tracks_to_rerun
 
 
+def get_sorted_frame_paths(cam_dir):
+    frames = glob.glob(os.path.join(cam_dir, '*.png')) + glob.glob(os.path.join(cam_dir, '*.jpg'))
+    def parse_frame_idx(path):
+        basename = os.path.splitext(os.path.basename(path))[0]
+        match = re.search(r'\d+', basename)
+        return int(match.group()) if match else 0
+    frames.sort(key=parse_frame_idx)
+    return frames
+
 def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
     """將 LLFF 轉換為 OpenCV，並進行解析度焦距自適應縮放"""
     H_bound, W_bound, f_bound = pose_llff[:, 4]
@@ -45,11 +54,66 @@ def llff_to_opencv_w2c(pose_llff, actual_W, actual_H):
     w2c_cv = np.linalg.inv(c2w_cv)[:3, :4]
     return w2c_cv, K
 
+def select_cams_by_fps(all_w2c_np, num_to_select, alpha=0.8, exclude_indices=[0]):
+    """
+    使用 FPS (最遠點採樣) 根據 3D 位置與視線方向篩選訓練視角
+    - exclude_indices: 排除的視角 (預設排除 index 0，即 cam00 / view_0 測試視角)
+    - alpha: 評分權重 (0.8 代表 80% 位置距離 + 20% 角度差距)
+    """
+    num_total = len(all_w2c_np)
+    valid_candidates = [i for i in range(num_total) if i not in exclude_indices]
+    
+    if num_to_select >= len(valid_candidates):
+        print(f"⚠️ 要求的相機數 ({num_to_select}) 大於等於可用訓練視角數 ({len(valid_candidates)})，回傳所有可用訓練視角。")
+        return sorted(valid_candidates)
+
+    centers, dirs = [], []
+    for w2c in all_w2c_np:
+        R = w2c[:3, :3]
+        t = w2c[:3, 3]
+        c = -R.T @ t                 # 世界座標下的相機中心
+        d = R.T @ np.array([0, 0, 1]) # 相機 Look-at 方向
+        centers.append(c)
+        dirs.append(d / (np.linalg.norm(d) + 1e-8))
+
+    centers = np.stack(centers)
+    dirs = np.stack(dirs)
+
+    max_pos_dist = np.max([np.linalg.norm(centers[i] - centers[j]) for i in valid_candidates for j in valid_candidates])
+    max_pos_dist = max(max_pos_dist, 1e-6)
+
+    selected_indices = [valid_candidates[0]]
+    
+    for _ in range(1, num_to_select):
+        combined_min_dists = []
+        for i in range(num_total):
+            if i in selected_indices or i in exclude_indices:
+                combined_min_dists.append(-1.0)
+                continue
+
+            scores = []
+            for s in selected_indices:
+                d_pos = np.linalg.norm(centers[i] - centers[s]) / max_pos_dist
+                cos_sim = np.dot(dirs[i], dirs[s])
+                d_rot = (1.0 - cos_sim) / 2.0
+                score = alpha * d_pos + (1.0 - alpha) * d_rot
+                scores.append(score)
+
+            combined_min_dists.append(np.min(scores))
+
+        next_idx = int(np.argmax(combined_min_dists))
+        selected_indices.append(next_idx)
+
+    return sorted(selected_indices)
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dir", type=str, required=True, help="n3d 資料集路徑")
     p.add_argument("--max_frames", type=int, default=300, help="限制載入的最大幀數 (避免 MVTracker OOM)")
     p.add_argument("--num_queries", type=int, default=512, help="要追蹤的點數量")
+    p.add_argument("--selected_cams", type=int, nargs="+", default=None, help="選擇的相機 index")
+    p.add_argument("--num_cams", type=int, default=5, help="當未指定 --selected_cams 時，使用 FPS 自動挑選的訓練相機數量")
+    p.add_argument("--fps_alpha", type=float, default=0.8, help="FPS 篩選權重: 3D 位置比例 (預設 0.8，即 80% 位置 + 20% 視線方向)")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
     p.add_argument("--use_gt_cameras", action="store_true", help="使用 GT 的相機內外參，並利用 GT 縮放 VGGT 深度")
     p.add_argument("--use_da3", action="store_true", help="使用 Depth Anything 3 取代 VGGT")
@@ -70,15 +134,23 @@ def main():
     # ==========================================
     # 1. 讀取影像與相機姿態
     # ==========================================
-    view_dirs = sorted(
-        glob.glob(os.path.join(args.dir, 'view_*')), 
-        key=lambda x: int(re.search(r'\d+', os.path.basename(x)).group())
-    )
-    sample_frames = sorted(glob.glob(os.path.join(view_dirs[0], '*.jpg')))
+    view_dirs = [f for f in glob.glob(os.path.join(args.dir, 'cam*')) if os.path.isdir(f)]
+    if not view_dirs:
+        view_dirs = [f for f in glob.glob(os.path.join(args.dir, 'view_*')) if os.path.isdir(f)]
+    if not view_dirs:
+        raise ValueError(f"在 {args.dir} 找不到任何 cam* 或 view_* 相機資料夾！")
+
+    def parse_cam_idx(path):
+        match = re.search(r'\d+', os.path.basename(path))
+        return int(match.group()) if match else 0
+
+    view_dirs.sort(key=parse_cam_idx)
+
+    sample_frames = get_sorted_frame_paths(view_dirs[0])
     num_frames = min(len(sample_frames), args.max_frames)
     sample_img = Image.open(sample_frames[0])
     W_img, H_img = sample_img.size
-    print(f"📷 處理圖片: {W_img}x{H_img} | 取樣幀數: {num_frames} 幀")
+    print(f"📷 處理圖片: {W_img}x{H_img} | 取樣幀數: {num_frames} 幀 | 相機視角數: {len(view_dirs)}")
 
     poses_path = os.path.join(args.dir, 'poses_bounds.npy')
     poses_bounds = np.load(poses_path)
@@ -92,7 +164,14 @@ def main():
     all_w2c_np = np.stack(all_w2c)
     all_intrs_np = np.stack(all_intrs)
 
-    SELECTED_CAMS = [16, 10, 13, 1, 18]
+    if args.selected_cams is not None:
+        SELECTED_CAMS = args.selected_cams
+        print(f"🎯 使用手動指定的相機視角 Index: {SELECTED_CAMS}")
+    else:
+        # 自動使用 FPS 在 3D 空間中挑選 (預設排除 view_0 測試視角)
+        SELECTED_CAMS = select_cams_by_fps(all_w2c_np, num_to_select=args.num_cams, alpha=args.fps_alpha, exclude_indices=[0])
+        print(f"🎯 自動使用 FPS (80% 位置 + 20% 角度) 挑選出最均勻的 {len(SELECTED_CAMS)} 個訓練視角 (已排除 view_0 測試視角): {SELECTED_CAMS}")
+
     V = len(SELECTED_CAMS)
     
     # 建構 Extrinsics 與 Intrinsics，維度擴展為 [V, T, ...]
@@ -119,7 +198,7 @@ def main():
     rgbs_list = []
 
     for cam_idx in tqdm(SELECTED_CAMS, desc="RGBD 讀取進度"):
-        frames = sorted(glob.glob(os.path.join(view_dirs[cam_idx], '*.jpg')))[:num_frames]
+        frames = get_sorted_frame_paths(view_dirs[cam_idx])[:num_frames]
         cam_rgbs = []
         for t in range(num_frames):
             img = Image.open(frames[t]).convert('RGB')
