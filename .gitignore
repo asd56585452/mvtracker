@@ -20,3 +20,4 @@ logs*
 /wandb
 *.rrd
 mask*.jpg
+/visualizations
