@@ -113,10 +113,14 @@ def main():
     p.add_argument("--num_queries", type=int, default=512, help="要追蹤的點數量")
     p.add_argument("--selected_cams", type=int, nargs="+", default=None, help="選擇的相機 index")
     p.add_argument("--num_cams", type=int, default=5, help="當未指定 --selected_cams 時，使用 FPS 自動挑選的訓練相機數量")
-    p.add_argument("--fps_alpha", type=float, default=0.8, help="FPS 篩選權重: 3D 位置比例 (預設 0.8，即 80% 位置 + 20% 視線方向)")
+    p.add_argument("--fps_alpha", type=float, default=0.8, help="FPS 篩選權重: 3D 位置比例 (預設 0.8，即 80%% 位置 + 20%% 視線方向)")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
     p.add_argument("--use_gt_cameras", action="store_true", help="使用 GT 的相機內外參，並利用 GT 縮放 VGGT 深度")
     p.add_argument("--use_da3", action="store_true", help="使用 Depth Anything 3 取代 VGGT")
+    p.add_argument("--da3_chunk_size", type=int, default=3, help="DA3 跨時間處理的 chunk size (大於 1 時可提供跨時間/幀的一致性)")
+    p.add_argument("--da3_model", type=str, default="depth-anything/DA3-GIANT-1.1", help="DA3 模型版本 (如 depth-anything/DA3-GIANT-1.1 或 depth-anything/DA3-LARGE-1.1)")
+    p.add_argument("--da3_layer_offload", action="store_true", default=None, help="強制啟用 DA3 動態分層推論 (未指定時若為 GIANT 且顯存<=16GB 則自動開啟)")
+    p.add_argument("--da3_process_res", type=int, default=560, help="DA3 推論解析度 (預設 560)")
     p.add_argument("--mask_img", type=str, default="mask.jpg", help="提供白色像素標註追蹤點的遮罩圖片路徑 (例如: mask.png)")
     p.add_argument("--mode", type=str, choices=["viz", "full", "both", "prove"], default="viz", help="運行模式: viz(視覺化), full(抽20萬點測速), both(測速並視覺化), prove(證明點間干擾)")
     p.add_argument("--full_num_queries", type=int, default=200000, help="正式測試模式要追蹤的總點數量")
@@ -124,7 +128,6 @@ def main():
     p.add_argument("--lightweight", action="store_true", help="使用輕量級視覺化 (適合網頁版 Viewer)")
     p.add_argument("--rrd", default="n3d_mvtracker_demo.rrd", help="輸出的 Rerun 檔名")
     p.add_argument("--start_frame", type=int, default=0, help="開始追蹤的幀數 (設定 t0)")
-    p.add_argument("--da3_chunk_size", type=int, default=3, help="DA3 跨時間處理的 chunk size (大於 1 時可提供跨時間/幀的一致性)")
     args = p.parse_args()
 
     np.random.seed(72)
@@ -222,7 +225,10 @@ def main():
                 extrs_gt=extrs_gt,
                 intrs_gt=intrs_gt,
                 skip_if_cached=False, # 記得重新提取一次
+                model_id=args.da3_model,
                 temporal_chunk_size=args.da3_chunk_size,
+                enable_layer_offload=args.da3_layer_offload,
+                process_res=args.da3_process_res,
             )
             
         # 🌟【關鍵修復】補齊真實世界尺度！

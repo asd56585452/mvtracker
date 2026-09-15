@@ -21,3 +21,4 @@ logs*
 *.rrd
 mask*.jpg
 /visualizations
+/output_da3_gs

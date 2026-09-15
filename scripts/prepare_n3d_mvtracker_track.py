@@ -289,7 +289,7 @@ def main():
     p.add_argument("--max_frames", type=int, default=300, help="限制載入的最大幀數 (避免 MVTracker OOM)")
     p.add_argument("--selected_cams", type=int, nargs="+", default=None, help="手動選擇的相機 ID 列表 (若未提供，則使用 FPS 自動挑選)")
     p.add_argument("--num_cams", type=int, default=5, help="當未指定 --selected_cams 時，使用 FPS 自動挑選的訓練相機數量")
-    p.add_argument("--fps_alpha", type=float, default=0.8, help="FPS 篩選權重: 3D 位置比例 (預設 0.8，即 80% 位置 + 20% 視線方向)")
+    p.add_argument("--fps_alpha", type=float, default=0.8, help="FPS 篩選權重: 3D 位置比例 (預設 0.8，即 80%% 位置 + 20%% 視線方向)")
     p.add_argument("--track_chunk_size", type=int, default=4096, help="MVTracker 追蹤時的分批大小，避免 OOM")
     p.add_argument("--use_dynamic_vggt_cameras", action="store_true", help="使用動態 VGGT 預測的內外參；若不加此參數，則將第1幀的內外參套用於所有後續幀")
     p.add_argument("--use_gt_cameras", action="store_true", help="使用 GT 的相機內外參，並利用 GT 縮放 VGGT 深度")
@@ -302,6 +302,9 @@ def main():
     p.add_argument("--query_sort_mode", type=str, default="round_robin", help="query 排序方式: round_robin 或 kmeans")
     p.add_argument("--export_vggt_all_frame_ply", action="store_true", help="將VGGT每幀重建結果合併成完整的4D點雲供比對")
     p.add_argument("--da3_chunk_size", type=int, default=3, help="DA3 跨時間處理的 chunk size (大於 1 時可提供跨時間/幀的一致性)")
+    p.add_argument("--da3_model", type=str, default="depth-anything/DA3-GIANT-1.1", help="DA3 模型版本 (如 depth-anything/DA3-GIANT-1.1 或 depth-anything/DA3-LARGE-1.1)")
+    p.add_argument("--da3_layer_offload", action="store_true", default=None, help="強制啟用 DA3 動態分層推論 (未指定時若為 GIANT 且顯存<=16GB 則自動開啟)")
+    p.add_argument("--da3_process_res", type=int, default=560, help="DA3 推論解析度 (預設 560)")
     p.add_argument("--use_dynamic_voxel", action="store_true", help="是否根據相機反投影像素足跡啟用動態體素下採樣")
     p.add_argument("--min_voxel_size", type=float, default=0.02, help="動態體素下採樣的最小體素大小 (近處物體解析度)")
     p.add_argument("--dynamic_voxel_scale", type=float, default=1.0, help="投影 Footprint 乘上的 scale 係數，用來調節動態 Voxel 大小")
@@ -405,7 +408,10 @@ def main():
                 extrs_gt=extrs_gt,
                 intrs_gt=intrs_gt,
                 skip_if_cached=False, # 記得重新提取一次
+                model_id=args.da3_model,
                 temporal_chunk_size=args.da3_chunk_size,
+                enable_layer_offload=args.da3_layer_offload,
+                process_res=args.da3_process_res,
             )
             
         # 🌟【關鍵修復】補齊真實世界尺度！
