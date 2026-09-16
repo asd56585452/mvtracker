@@ -22,3 +22,4 @@ logs*
 mask*.jpg
 /visualizations
 /output_da3_gs
+/mvtracker_results
