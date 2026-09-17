@@ -491,6 +491,545 @@ class RGBTextureScorer(nn.Module):
         }
 
 
+# ==============================================================================
+# 第 3 節：DA3 幾何深度與曲率分數 (S_depth) 模組
+# 全面對齊業界標準函式庫：
+# - 法向量：OpenCV LINEMOD (Stefan Holzer et al., BMVC 2012) 單側最小差分 (Min-Gradient)
+# - 曲率：PCL (Point Cloud Library) max_depth_change_factor 深度斷差門檻過濾
+# - 掠射角濾波：COLMAP / 2DGS (SIGGRAPH 2024) 80度餘弦平滑截斷 (Anti-Streaking)
+# ==============================================================================
+
+def log_depth_gradient(
+    depth: torch.Tensor,
+    quantile: float = 0.98,
+    normalize: bool = True,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    計算對數深度的一階空間梯度幅值 S_depth_grad。
+    原理: ∇(ln D) = ∇D / D，具備尺度不變性 (Scale-Invariant)，專職捕捉物體幾何輪廓與遮擋斷差 (Silhouettes)。
+    邊緣處理: 採用 Replicate Padding，消除影像邊界假跳變。
+    極值防護: 採用動態分位數 (預設 98%) 截斷，排除飛點與極值噪聲。
+    
+    Args:
+        depth: [..., 1, H, W] 或 [..., H, W] 深度圖 (公尺單位，需 > 0)。
+        quantile: 動態分位數截斷上限 (0.0 ~ 1.0)。
+        normalize: 是否歸一化至 [0, 1]。
+        eps: 數值穩定 epsilon。
+    Returns:
+        s_depth_grad: [..., 1, H, W] 梯度幅值圖。
+    """
+    orig_ndim = depth.ndim
+    if orig_ndim == 2:
+        depth = depth.unsqueeze(0).unsqueeze(0)
+    elif orig_ndim == 3:
+        if depth.shape[0] == 1:
+            depth = depth.unsqueeze(0)
+        else:
+            depth = depth.unsqueeze(1)
+
+    device = depth.device
+    dtype = depth.dtype
+
+    # 對數深度轉換
+    depth_clean = torch.clamp(depth, min=eps)
+    log_d = torch.log(depth_clean)
+
+    # 3x3 Sobel 卷積核 (歸一化 1/8)
+    sobel_x = torch.tensor([
+        [-1.0, 0.0, 1.0],
+        [-2.0, 0.0, 2.0],
+        [-1.0, 0.0, 1.0]
+    ], device=device, dtype=dtype).view(1, 1, 3, 3) / 8.0
+
+    sobel_y = torch.tensor([
+        [-1.0, -2.0, -1.0],
+        [ 0.0,  0.0,  0.0],
+        [ 1.0,  2.0,  1.0]
+    ], device=device, dtype=dtype).view(1, 1, 3, 3) / 8.0
+
+    # 邊界複製填充
+    log_d_padded = F.pad(log_d, (1, 1, 1, 1), mode='replicate')
+    gx = F.conv2d(log_d_padded, sobel_x)
+    gy = F.conv2d(log_d_padded, sobel_y)
+
+    grad_mag = torch.sqrt(gx ** 2 + gy ** 2 + 1e-12)
+
+    # 98% 動態分位數截斷
+    if quantile is not None and 0.0 < quantile < 1.0:
+        flat = grad_mag.detach().flatten()
+        if flat.numel() > 100:
+            q_val = torch.quantile(flat, quantile)
+            if q_val > 1e-6:
+                grad_mag = torch.clamp(grad_mag, max=q_val)
+                if normalize:
+                    grad_mag = grad_mag / q_val
+
+    if normalize and (quantile is None or quantile <= 0.0):
+        max_v = grad_mag.max()
+        if max_v > 1e-6:
+            grad_mag = grad_mag / max_v
+
+    return grad_mag
+
+
+def depth_to_surface_normals(
+    depth: torch.Tensor,
+    intrinsics: Optional[torch.Tensor] = None,
+    method: str = "min_gradient",
+    eps: float = 1e-6
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    從深度圖反投影求得三維表面單位法向量 n(u, v) 與 3D 空間點 P(u, v)。
+    支援 OpenCV LINEMOD 標準之單側最小差分法 (Min-Gradient):
+    在每個像素點分別計算左右差分 (ΔL, ΔR) 與上下差分 (ΔT, ΔB)，選取深度變化小的一側計算切線，
+    從源頭杜絕跨越前後景遮擋邊界的連線，徹底避免生成掠射角假懸崖 (Phantom Wall)。
+
+    Args:
+        depth: [..., 1, H, W] 或 [..., H, W] 深度圖 (公尺)。
+        intrinsics: 可選相機內參矩陣 [3, 3] 或 [..., 3, 3] (fx, fy, cx, cy)。
+                    若為 None 則以標準針孔視角自適應推算 (fx=fy=max(H,W), cx=W/2, cy=H/2)。
+        method: 'min_gradient' (OpenCV LINEMOD 標準，強烈推薦) 或 'central' (經典中心差分)。
+        eps: 數值穩定 epsilon。
+    Returns:
+        normals: [..., 3, H, W] 單位法向量，統一朝向相機側 (標準相機座標: X-右, Y-下, Z-前)。
+        points_3d: [..., 3, H, W] 反投影 3D 空間點。
+    """
+    orig_ndim = depth.ndim
+    if orig_ndim == 2:
+        depth = depth.unsqueeze(0).unsqueeze(0)
+    elif orig_ndim == 3:
+        if depth.shape[0] == 1:
+            depth = depth.unsqueeze(0)
+        else:
+            depth = depth.unsqueeze(1)
+
+    *batch_dims, _, H, W = depth.shape
+    device = depth.device
+    dtype = depth.dtype
+
+    # 建立像素座標網格 (u: 0~W-1, v: 0~H-1)
+    v_grid, u_grid = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing='ij'
+    )
+    u_grid = u_grid.expand(*batch_dims, 1, H, W)
+    v_grid = v_grid.expand(*batch_dims, 1, H, W)
+
+    # 內參解析
+    if intrinsics is not None:
+        if intrinsics.ndim == 2:
+            fx = intrinsics[0, 0]
+            fy = intrinsics[1, 1]
+            cx = intrinsics[0, 2]
+            cy = intrinsics[1, 2]
+        else:
+            fx = intrinsics[..., 0:1, 0:1].unsqueeze(-1)
+            fy = intrinsics[..., 1:2, 1:2].unsqueeze(-1)
+            cx = intrinsics[..., 0:1, 2:3].unsqueeze(-1)
+            cy = intrinsics[..., 1:2, 2:3].unsqueeze(-1)
+    else:
+        focal = float(max(H, W))
+        fx = fy = focal
+        cx = W / 2.0
+        cy = H / 2.0
+
+    depth_clean = torch.clamp(depth, min=eps)
+    x_3d = (u_grid - cx) * depth_clean / fx
+    y_3d = (v_grid - cy) * depth_clean / fy
+    z_3d = depth_clean
+
+    # 空間 3D 點張量 [..., 3, H, W]
+    points_3d = torch.cat([x_3d, y_3d, z_3d], dim=-3)
+
+    if method == "min_gradient":
+        # ======================================================================
+        # OpenCV LINEMOD 標準實做: 單側最小差分 (Min-Gradient)
+        # ======================================================================
+        p_pad = F.pad(points_3d, (1, 1, 1, 1), mode='replicate')
+
+        # 水平切向量候選: 左差分 (中心 - 左) vs 右差分 (右 - 中心)
+        delta_l = points_3d - p_pad[..., 1:-1, :-2]
+        delta_r = p_pad[..., 1:-1, 2:] - points_3d
+
+        dz_l = torch.abs(delta_l[..., 2:3, :, :])
+        dz_r = torch.abs(delta_r[..., 2:3, :, :])
+
+        use_left = (dz_l < dz_r).clone()
+        # 邊界保全: 左邊界 col 0 無左鄰居，強制用右差分；右邊界 col W-1 無右鄰居，強制用左差分
+        use_left[..., :, :, 0:1] = False
+        use_left[..., :, :, -1:] = True
+        dx_3d = torch.where(use_left.expand_as(delta_l), delta_l, delta_r)
+
+        # 垂直切向量候選: 上差分 (中心 - 上) vs 下差分 (下 - 中心)
+        delta_t = points_3d - p_pad[..., :-2, 1:-1]
+        delta_b = p_pad[..., 2:, 1:-1] - points_3d
+
+        dz_t = torch.abs(delta_t[..., 2:3, :, :])
+        dz_b = torch.abs(delta_b[..., 2:3, :, :])
+
+        use_top = (dz_t < dz_b).clone()
+        # 邊界保全: 上邊界 row 0 無上鄰居，強制用下差分；下邊界 row H-1 無下鄰居，強制用上差分
+        use_top[..., :, 0:1, :] = False
+        use_top[..., :, -1:, :] = True
+        dy_3d = torch.where(use_top.expand_as(delta_t), delta_t, delta_b)
+
+    else:
+        # 經典中心差分 (Central Difference)
+        p_pad = F.pad(points_3d, (1, 1, 1, 1), mode='replicate')
+        dx_3d = (p_pad[..., 1:-1, 2:] - p_pad[..., 1:-1, :-2]) / 2.0
+        dy_3d = (p_pad[..., 2:, 1:-1] - p_pad[..., :-2, 1:-1]) / 2.0
+
+    # 切向量外積求法向量: n = dx × dy
+    # 相機座標系: X-右, Y-下, Z-前
+    # dx × dy = (dx_y*dy_z - dx_z*dy_y, dx_z*dy_x - dx_x*dy_z, dx_x*dy_y - dx_y*dy_x)
+    nx = dx_3d[..., 1:2, :, :] * dy_3d[..., 2:3, :, :] - dx_3d[..., 2:3, :, :] * dy_3d[..., 1:2, :, :]
+    ny = dx_3d[..., 2:3, :, :] * dy_3d[..., 0:1, :, :] - dx_3d[..., 0:1, :, :] * dy_3d[..., 2:3, :, :]
+    nz = dx_3d[..., 0:1, :, :] * dy_3d[..., 1:2, :, :] - dx_3d[..., 1:2, :, :] * dy_3d[..., 0:1, :, :]
+
+    normal_raw = torch.cat([nx, ny, nz], dim=-3)
+
+    # 統一法向量朝向觀察者側 (在相機座標系中，面對相機的平面其 nz 應為負值，即朝向原點；
+    # 為了讓 RGB 視覺化呈標準淺藍色 [0.5, 0.5, 1.0]，我們將朝向相機方向規定為 nz > 0)
+    flip_mask = (normal_raw[..., 2:3, :, :] < 0.0)
+    normal_oriented = torch.where(flip_mask.expand_as(normal_raw), -normal_raw, normal_raw)
+
+    # 單位長度歸一化
+    norm_len = torch.sqrt(torch.sum(normal_oriented ** 2, dim=-3, keepdim=True) + 1e-12)
+    normals = normal_oriented / norm_len
+
+    return normals, points_3d
+
+
+def depth_gated_surface_curvature(
+    normals: torch.Tensor,
+    depth: torch.Tensor,
+    kernel_size: int = 5,
+    max_depth_change_factor: float = 0.05,
+    soft_gating: bool = True,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    對齊 PCL (Point Cloud Library) max_depth_change_factor 標準之表面法向曲率計算。
+    原理:
+        在 k x k 滑動窗口內計算平均法向量 n_avg。
+        若相鄰像素與中心像素的相對深度跳變 |D_neighbor - D_center| / D_center > max_depth_change_factor，
+        判定為跨物體表面斷差，權重予以剔除或高斯衰減。
+        局部曲率離散度: S_curv = 1.0 - ||n_avg||
+        - 完全平坦表面: S_curv = 0.0 (即便在物體邊緣，背景點被剔除後，窗口內同表面法向一致，仍為 0，杜絕假光暈)
+        - 連續彎曲表面 (如球面、人臉): S_curv > 0.0
+
+    Args:
+        normals: [..., 3, H, W] 單位法向量。
+        depth: [..., 1, H, W] 深度圖 (公尺)。
+        kernel_size: 滑動窗口大小 (奇數，預設 5)。
+        max_depth_change_factor: PCL 深度跳變容許比率 (預設 0.05 即 5%)。
+        soft_gating: 是否採用可微分的軟性雙邊深度加權 (預設 True)。
+        eps: 數值穩定 epsilon。
+    Returns:
+        s_curv: [..., 1, H, W] 曲率分數圖 [0, 1]。
+    """
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    pad = kernel_size // 2
+
+    *batch_dims, C, H, W = normals.shape
+    device = normals.device
+    dtype = normals.dtype
+
+    # 將 depth 調整為 [B, 1, H, W] 進行 Unfold 操作
+    b_size = 1
+    for d in batch_dims:
+        b_size *= d
+    
+    depth_flat = depth.view(b_size, 1, H, W)
+    depth_clean = torch.clamp(depth_flat, min=eps)
+    normals_flat = normals.view(b_size, 3, H, W)
+
+    # 利用 F.unfold 提取局部 k x k 窗口
+    depth_pad = F.pad(depth_clean, (pad, pad, pad, pad), mode='replicate')
+    # patches: [B, k*k, H*W]
+    d_patches = F.unfold(depth_pad, kernel_size=(kernel_size, kernel_size))
+    
+    # 中心點深度 [B, 1, H*W]
+    d_center = depth_clean.view(b_size, 1, H * W)
+
+    # 計算局部相對深度跳變 |D_neighbor - D_center| / D_center
+    rel_depth_diff = torch.abs(d_patches - d_center) / (d_center + 1e-7)
+
+    if soft_gating:
+        # 可微分雙邊深度權重: exp(- (diff / factor)^2 / 2)
+        sigma = max_depth_change_factor / 2.0
+        weights = torch.exp(- (rel_depth_diff ** 2) / (2.0 * sigma * sigma)) # [B, k*k, H*W]
+    else:
+        # 嚴格硬門檻 (Hard Mask)
+        weights = (rel_depth_diff < max_depth_change_factor).to(dtype)
+
+    # 空間反向展開法向量 patches
+    normals_pad = F.pad(normals_flat, (pad, pad, pad, pad), mode='replicate')
+    n_patches = F.unfold(normals_pad, kernel_size=(kernel_size, kernel_size)) # [B, 3 * k*k, H*W]
+    n_patches = n_patches.view(b_size, 3, kernel_size * kernel_size, H * W)
+
+    # 深度加權法向量平均: n_avg = Σ(w * n) / Σ(w)
+    weights_expanded = weights.unsqueeze(1) # [B, 1, k*k, H*W]
+    sum_w = torch.sum(weights_expanded, dim=2) + 1e-8 # [B, 1, H*W]
+    sum_wn = torch.sum(weights_expanded * n_patches, dim=2) # [B, 3, H*W]
+    n_avg = sum_wn / sum_w
+
+    # 計算平均法向向量長度
+    n_avg_len = torch.sqrt(torch.sum(n_avg ** 2, dim=1, keepdim=True) + 1e-12) # [B, 1, H*W]
+    s_curv = torch.clamp(1.0 - n_avg_len, min=0.0, max=1.0)
+    s_curv = s_curv.view(*batch_dims, 1, H, W)
+
+    return s_curv
+
+
+def grazing_angle_filter(
+    normals: torch.Tensor,
+    points_3d: torch.Tensor,
+    max_angle_deg: float = 80.0,
+    min_angle_deg: float = 70.0,
+    eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    對齊 COLMAP 與 3DGS (SIGGRAPH 2024 2DGS) 之掠射角防拉扯濾波器 (Anti-Streaking Filter)。
+    原理:
+        計算空間三維點視線方向 v = P / ||P|| 與表面法向量 n 的夾角餘弦 cos(θ) = |n · v|。
+        當夾角接近 90 度 (掠射角 / 視線邊緣切向) 時，反投影極易在空間中拉扯出長條虛擬網格或空中浮點 (Floaters)。
+        本濾波器在 max_angle_deg (預設 80°) 處將權重平滑衰減至 0。
+
+    Args:
+        normals: [..., 3, H, W] 單位法向量。
+        points_3d: [..., 3, H, W] 空間三維點座標。
+        max_angle_deg: 權重完全歸零之最大夾角 (預設 80.0 度)。
+        min_angle_deg: 開始進行衰減之起始夾角 (預設 70.0 度)。
+    Returns:
+        w_grazing: [..., 1, H, W] 掠射角濾波權重 [0.0, 1.0]。
+    """
+    # 視線方向向量 (由相機原點指向 3D 空間點)
+    ray_len = torch.sqrt(torch.sum(points_3d ** 2, dim=-3, keepdim=True) + 1e-12)
+    view_ray = points_3d / ray_len
+
+    # 夾角餘弦值 cos(θ) = |n · v|
+    cos_theta = torch.abs(torch.sum(normals * view_ray, dim=-3, keepdim=True))
+
+    cos_max = math.cos(math.radians(max_angle_deg)) # 80° ≈ 0.1736
+    cos_min = math.cos(math.radians(min_angle_deg)) # 70° ≈ 0.3420
+
+    # 平滑過渡權重: 在 cos_max 以下為 0，在 cos_min 以上為 1
+    w_grazing = torch.clamp((cos_theta - cos_max) / (cos_min - cos_max + 1e-7), min=0.0, max=1.0)
+
+    return w_grazing
+
+
+class DepthGeometryScorer(nn.Module):
+    """
+    DA3 幾何深度與曲率評分模組 (S_depth)。
+    整合:
+    1. 對數深度一階斷差梯度 S_depth_grad (外輪廓邊界鎖定)
+    2. PCL 深度門檻保護之局部表面曲率 S_curv (連續曲面感知，無邊緣光暈)
+    3. 掠射角防拉扯濾波 w_grazing (保護曲面，不干涉真實外輪廓)
+    4. 幾何斷差互斥閘門 (Edge Gating): 在強斷差處曲率自動讓位
+    5. DA3 信心度 (c_DA3) 硬門檻剔除與軟加權調製
+    """
+    def __init__(
+        self,
+        w_d_edge: float = 1.0,
+        w_curv: float = 1.0,
+        curv_ksize: int = 5,
+        max_depth_change_factor: float = 0.05,
+        conf_thresh: float = 0.3,
+        grazing_max_angle: float = 80.0,
+        edge_gate_thresh: float = 0.4
+    ):
+        super().__init__()
+        self.w_d_edge = w_d_edge
+        self.w_curv = w_curv
+        self.curv_ksize = curv_ksize
+        self.max_depth_change_factor = max_depth_change_factor
+        self.conf_thresh = conf_thresh
+        self.grazing_max_angle = grazing_max_angle
+        self.edge_gate_thresh = edge_gate_thresh
+
+    def forward(
+        self,
+        depth: torch.Tensor,
+        conf: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        計算幾何深度分數。
+        Args:
+            depth: [..., 1, H, W] 深度圖 (公尺)。
+            conf: 可選 DA3 信心度圖 [..., 1, H, W]。
+            intrinsics: 可選相機內參 [3, 3] 或 [..., 3, 3]。
+        Returns:
+            Dict 包含:
+                's_depth': 最終幾何深度綜合分數
+                's_depth_grad': 一階對數深度斷差梯度
+                's_curv': 原始 PCL 門檻曲率
+                's_curv_gated': 互斥與掠射角防護後之曲率
+                'normals': 表面法向量圖 [..., 3, H, W]
+                'w_grazing': 掠射角權重圖
+                'conf_mask': 信心度遮罩
+        """
+        # 1. 幾何輪廓斷差梯度
+        s_depth_grad = log_depth_gradient(depth, quantile=0.98, normalize=True)
+
+        # 2. OpenCV LINEMOD 標準法向量
+        normals, points_3d = depth_to_surface_normals(
+            depth, intrinsics=intrinsics, method="min_gradient"
+        )
+
+        # 3. PCL 深度門檻曲率
+        s_curv = depth_gated_surface_curvature(
+            normals=normals,
+            depth=depth,
+            kernel_size=self.curv_ksize,
+            max_depth_change_factor=self.max_depth_change_factor
+        )
+
+        # 4. 掠射角防拉扯濾波
+        w_grazing = grazing_angle_filter(
+            normals=normals,
+            points_3d=points_3d,
+            max_angle_deg=self.grazing_max_angle
+        )
+
+        # 5. 斷差互斥閘門 (Edge Gating): 當深度梯度極大時，曲率自動退場
+        edge_mask = torch.sigmoid(20.0 * (s_depth_grad - self.edge_gate_thresh))
+        s_curv_gated = s_curv * w_grazing * (1.0 - edge_mask)
+
+        # 6. 綜合加權幾何分數
+        geom_raw = self.w_d_edge * s_depth_grad + self.w_curv * s_curv_gated
+
+        # 7. DA3 信心度過濾與調製
+        if conf is not None:
+            # 確保 conf 維度一致
+            if conf.ndim == 2:
+                conf = conf.unsqueeze(0).unsqueeze(0)
+            elif conf.ndim == 3 and conf.shape[0] != 1:
+                conf = conf.unsqueeze(1)
+
+            # 硬門檻遮罩 (剔除無效天空、過曝或窗外飄浮噪點)
+            conf_mask = (conf > self.conf_thresh).to(depth.dtype)
+
+            # 軟加權歸一化調製 (以 95% 信心度為飽和上限)
+            c_max = torch.quantile(conf.detach().flatten(), 0.95)
+            if c_max > 1e-4:
+                conf_soft = torch.clamp(conf / c_max, max=1.0)
+            else:
+                conf_soft = conf
+
+            s_depth = geom_raw * conf_mask * conf_soft
+        else:
+            conf_mask = torch.ones_like(s_depth_grad)
+            s_depth = geom_raw
+
+        return {
+            's_depth': s_depth,
+            's_depth_grad': s_depth_grad,
+            's_curv': s_curv,
+            's_curv_gated': s_curv_gated,
+            'normals': normals,
+            'w_grazing': w_grazing,
+            'conf_mask': conf_mask,
+            'points_3d': points_3d
+        }
+
+
+class Spatial2DScorer(nn.Module):
+    """
+    一站式 2D 空間綜合評分器 (S_2D)。
+    整合 RGB 紋理分數 (S_tex) 與 DA3 幾何深度分數 (S_depth)：
+        S_2D = w_0 + w_tex * S_tex + w_depth * S_depth
+    """
+    def __init__(
+        self,
+        w_0: float = 0.0,
+        w_tex: float = 1.0,
+        w_depth: float = 1.0,
+        w_sobel: float = 1.0,
+        w_dct: float = 1.0,
+        w_chroma: float = 0.5,
+        w_d_edge: float = 1.0,
+        w_curv: float = 1.0,
+        curv_ksize: int = 5,
+        max_depth_change_factor: float = 0.05,
+        conf_thresh: float = 0.3
+    ):
+        super().__init__()
+        self.w_0 = w_0
+        self.w_tex = w_tex
+        self.w_depth = w_depth
+
+        self.tex_scorer = RGBTextureScorer(
+            default_weights=(w_sobel, w_dct, w_chroma)
+        )
+        self.geom_scorer = DepthGeometryScorer(
+            w_d_edge=w_d_edge,
+            w_curv=w_curv,
+            curv_ksize=curv_ksize,
+            max_depth_change_factor=max_depth_change_factor,
+            conf_thresh=conf_thresh
+        )
+
+    def forward(
+        self,
+        rgb: torch.Tensor,
+        depth: Optional[torch.Tensor] = None,
+        conf: Optional[torch.Tensor] = None,
+        intrinsics: Optional[torch.Tensor] = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        計算綜合空間分數。
+        """
+        tex_res = self.tex_scorer(rgb)
+        s_tex = tex_res['s_tex']
+
+        res = {
+            's_tex': s_tex,
+            's_sobel': tex_res['s_sobel'],
+            's_dct': tex_res['s_dct'],
+            's_chroma': tex_res['s_chroma']
+        }
+
+        if depth is not None:
+            # 幾何評分在深度圖的原生解析度下進行計算，避免雙線性插值對深度微分造成摺痕與偽曲率
+            geom_res = self.geom_scorer(depth, conf=conf, intrinsics=intrinsics)
+            s_depth = geom_res['s_depth']
+
+            target_hw = rgb.shape[-2:]
+            # 若深度圖尺寸與 RGB 尺寸不同，平滑插值幾何特徵至 RGB 尺寸
+            if s_depth.shape[-2:] != target_hw:
+                s_depth = F.interpolate(s_depth, size=target_hw, mode='bilinear', align_corners=False)
+                for k in ['s_depth_grad', 's_curv', 's_curv_gated', 'w_grazing', 'conf_mask']:
+                    if k in geom_res and geom_res[k] is not None:
+                        geom_res[k] = F.interpolate(geom_res[k], size=target_hw, mode='bilinear', align_corners=False)
+                if 'normals' in geom_res and geom_res['normals'] is not None:
+                    n_up = F.interpolate(geom_res['normals'], size=target_hw, mode='bilinear', align_corners=False)
+                    n_len = torch.sqrt(torch.sum(n_up ** 2, dim=-3, keepdim=True) + 1e-12)
+                    geom_res['normals'] = n_up / n_len
+
+            s_2d = self.w_0 + self.w_tex * s_tex + self.w_depth * s_depth
+
+            res.update({
+                's_depth': s_depth,
+                's_depth_grad': geom_res['s_depth_grad'],
+                's_curv': geom_res['s_curv'],
+                's_curv_gated': geom_res['s_curv_gated'],
+                'normals': geom_res['normals'],
+                'w_grazing': geom_res['w_grazing'],
+                'conf_mask': geom_res['conf_mask'],
+                's_2d': s_2d
+            })
+        else:
+            res['s_2d'] = self.w_0 + self.w_tex * s_tex
+
+        return res
+
+
 class DistributionMatcherLoss(nn.Module):
     """
     可微分分佈對齊與權重超參數優化器 (第 5 節)。
@@ -550,3 +1089,4 @@ class DistributionMatcherLoss(nn.Module):
         total_loss = kl_loss + reg_loss
 
         return total_loss, p_pred
+
