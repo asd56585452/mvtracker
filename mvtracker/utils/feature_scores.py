@@ -371,6 +371,7 @@ class RGBTextureScorer(nn.Module):
         min_noise_floor: float = 0.005,
         quantile: float = 0.99,
         min_scale: float = 0.02,
+        normalize: bool = True,
         border_margin: int = 0,
         default_weights: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     ):
@@ -383,6 +384,7 @@ class RGBTextureScorer(nn.Module):
         self.min_noise_floor = min_noise_floor
         self.quantile = quantile
         self.min_scale = min_scale
+        self.normalize = normalize
         self.border_margin = border_margin
         self.default_weights = default_weights
 
@@ -391,13 +393,17 @@ class RGBTextureScorer(nn.Module):
         rgb: torch.Tensor,
         w_grad: Optional[float] = None,
         w_band: Optional[float] = None,
-        w_color: Optional[float] = None
+        w_color: Optional[float] = None,
+        normalize: Optional[bool] = None,
+        scale_factors: Optional[Dict[str, float]] = None
     ) -> Dict[str, torch.Tensor]:
         """
         前向傳導計算各特徵與融合分數。
         Args:
             rgb: [B, 3, H, W] 或 [3, H, W]，值域 [0, 1] 或 [0, 255]
             w_grad, w_band, w_color: 融合權重 (若為 None 則使用 default_weights)
+            normalize: 是否進行 [0, 1] 正規化 (若為 None 則使用 self.normalize)
+            scale_factors: 跨視角共享尺度 (字典包含 's_sobel', 's_dct', 's_chroma' 的全域分母)
         Returns:
             dict 包含:
                 's_sobel': 像素級邊界分數 [B, 1, H, W] (經抗噪與正規化)
@@ -414,6 +420,7 @@ class RGBTextureScorer(nn.Module):
         wg = self.default_weights[0] if w_grad is None else w_grad
         wb = self.default_weights[1] if w_band is None else w_band
         wc = self.default_weights[2] if w_color is None else w_color
+        norm = self.normalize if normalize is None else normalize
 
         # 1. 轉為 YCbCr 色彩空間
         ycbcr = rgb_to_ycbcr(rgb)
@@ -447,10 +454,21 @@ class RGBTextureScorer(nn.Module):
         s_dct_cored = noise_coring(s_dct_raw, coring_ratio=self.coring_ratio, min_noise_floor=self.min_noise_floor)
         s_chroma_cored = noise_coring(s_chroma_raw, coring_ratio=self.coring_ratio, min_noise_floor=self.min_noise_floor)
 
-        # 5. 抗噪第 4 層：全域 99% 極值截斷與正規化至 [0, 1]
-        s_sobel_clean = robust_quantile_clamp(s_sobel_cored, quantile=self.quantile, normalize=True, min_scale=self.min_scale)
-        s_dct_clean = robust_quantile_clamp(s_dct_cored, quantile=self.quantile, normalize=True, min_scale=self.min_scale)
-        s_chroma_clean = robust_quantile_clamp(s_chroma_cored, quantile=self.quantile, normalize=True, min_scale=self.min_scale)
+        # 5. 抗噪第 4 層：極值截斷與正規化 (支援跨視角全域尺度)
+        if scale_factors is not None:
+            s_sobel_clean = robust_quantile_clamp(s_sobel_cored, quantile=self.quantile, normalize=False)
+            s_dct_clean = robust_quantile_clamp(s_dct_cored, quantile=self.quantile, normalize=False)
+            s_chroma_clean = robust_quantile_clamp(s_chroma_cored, quantile=self.quantile, normalize=False)
+            if 's_sobel' in scale_factors and scale_factors['s_sobel'] > 0:
+                s_sobel_clean = torch.clamp(s_sobel_clean / scale_factors['s_sobel'], 0.0, 1.0)
+            if 's_dct' in scale_factors and scale_factors['s_dct'] > 0:
+                s_dct_clean = torch.clamp(s_dct_clean / scale_factors['s_dct'], 0.0, 1.0)
+            if 's_chroma' in scale_factors and scale_factors['s_chroma'] > 0:
+                s_chroma_clean = torch.clamp(s_chroma_clean / scale_factors['s_chroma'], 0.0, 1.0)
+        else:
+            s_sobel_clean = robust_quantile_clamp(s_sobel_cored, quantile=self.quantile, normalize=norm, min_scale=self.min_scale)
+            s_dct_clean = robust_quantile_clamp(s_dct_cored, quantile=self.quantile, normalize=norm, min_scale=self.min_scale)
+            s_chroma_clean = robust_quantile_clamp(s_chroma_cored, quantile=self.quantile, normalize=norm, min_scale=self.min_scale)
 
         # 可選邊界抑制 (Border Margin Suppression)
         if self.border_margin > 0:

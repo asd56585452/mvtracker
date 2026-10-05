@@ -120,7 +120,7 @@ def main():
     p.add_argument("--da3_chunk_size", type=int, default=3, help="DA3 跨時間處理的 chunk size (大於 1 時可提供跨時間/幀的一致性)")
     p.add_argument("--da3_model", type=str, default="depth-anything/DA3-GIANT-1.1", help="DA3 模型版本 (如 depth-anything/DA3-GIANT-1.1 或 depth-anything/DA3-LARGE-1.1)")
     p.add_argument("--da3_layer_offload", action="store_true", default=None, help="強制啟用 DA3 動態分層推論 (未指定時若為 GIANT 且顯存<=16GB 則自動開啟)")
-    p.add_argument("--da3_process_res", type=int, default=560, help="DA3 推論解析度 (預設 560)")
+    p.add_argument("--da3_process_res", type=int, default=728, help="DA3 推論解析度 (預設 728)")
     p.add_argument("--mask_img", type=str, default="mask.jpg", help="提供白色像素標註追蹤點的遮罩圖片路徑 (例如: mask.png)")
     p.add_argument("--mode", type=str, choices=["viz", "full", "both", "prove"], default="viz", help="運行模式: viz(視覺化), full(抽20萬點測速), both(測速並視覺化), prove(證明點間干擾)")
     p.add_argument("--full_num_queries", type=int, default=200000, help="正式測試模式要追蹤的總點數量")
@@ -218,7 +218,7 @@ def main():
         from mvtracker.datasets.generic_scene_dataset import _ensure_da3_aligned_cache_and_load
         print(f"🚀 提取 DA3 深度 (帶有 GT 位姿約束)...")
         with torch.no_grad():
-            depths_tensor, _, intrs_model, extrs_model = _ensure_da3_aligned_cache_and_load(
+            depths_tensor, _, intrs_model, extrs_model, *extra = _ensure_da3_aligned_cache_and_load(
                 rgbs=rgbs_tensor,
                 seq_name="n3d_da3_aligned",
                 dataset_root=args.dir,

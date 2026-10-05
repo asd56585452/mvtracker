@@ -985,7 +985,7 @@ def _ensure_da3_aligned_cache_and_load(
         model_id: str = "depth-anything/DA3-GIANT-1.1",
         temporal_chunk_size: int = 3,
         enable_layer_offload: Optional[bool] = None,
-        process_res: int = 560,
+        process_res: int = 728,
 ):
     """
     執行 DA3 並快取預測結果。
@@ -996,6 +996,7 @@ def _ensure_da3_aligned_cache_and_load(
       confs        [V,T,1,H,W]  (常數 100)
       intrs_gt     [V,T,3,3]    (直接回傳 GT)
       extrs_gt     [V,T,3,4]    (直接回傳 GT)
+      depths_raw   [V,T,1,H_raw,W_raw] (DA3 原始推理解析度深度圖，保留連續表面，無 nearest-neighbor 插值階梯紋)
     """
     import gc
     
@@ -1004,11 +1005,13 @@ def _ensure_da3_aligned_cache_and_load(
     os.makedirs(cache_root, exist_ok=True)
 
     f_depths = os.path.join(cache_root, "da3_depths.npy")
+    f_depths_raw = os.path.join(cache_root, "da3_depths_raw.npy")
 
     if skip_if_cached and os.path.isfile(f_depths):
         depths = torch.from_numpy(np.load(f_depths)).float().unsqueeze(2)
         confs = torch.full_like(depths, 100.0)
-        return depths, confs, intrs_gt.clone(), extrs_gt.clone()
+        depths_raw = torch.from_numpy(np.load(f_depths_raw)).float().unsqueeze(2) if os.path.isfile(f_depths_raw) else None
+        return depths, confs, intrs_gt.clone(), extrs_gt.clone(), depths_raw
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_dtype = torch.bfloat16 if (
@@ -1032,6 +1035,7 @@ def _ensure_da3_aligned_cache_and_load(
     model.eval()
 
     depths_arr = torch.empty((V, T, H, W), dtype=torch.float32)
+    depths_raw_arr = None
 
     with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype):
         for t_start in tqdm(range(0, T, temporal_chunk_size), desc=f"DA3 Inference {seq_name}", unit="chunk"):
@@ -1055,17 +1059,43 @@ def _ensure_da3_aligned_cache_and_load(
             extr_4x4[:, :3, :4] = extr_chunk
             extr_4x4[:, 3, 3] = 1.0
 
-            pred = model.inference(
-                images_chunk, 
-                extrinsics=extr_4x4, 
-                intrinsics=intr_chunk,
-                process_res=process_res,
-                align_to_input_ext_scale=True,
-                ref_view_strategy="saddle_balanced" 
-            )
+            try:
+                pred = model.inference(
+                    images_chunk, 
+                    extrinsics=extr_4x4, 
+                    intrinsics=intr_chunk,
+                    process_res=process_res,
+                    align_to_input_ext_scale=True,
+                    ref_view_strategy="saddle_balanced" 
+                )
+                pred_depth_np = pred.depth
+            except Exception as e:
+                print(f"⚠️ Chunk ({t_start}~{t_end}) 多幀聯合對齊異常 ({e})，自動降級為逐幀安全推論...")
+                sub_depths = []
+                for sub_t in range(t_start, t_end):
+                    sub_imgs = [rgbs[v, sub_t].permute(1, 2, 0).cpu().numpy() for v in range(V)]
+                    sub_extr = extrs_gt[:, sub_t].cpu().numpy()
+                    sub_intr = intrs_gt[:, sub_t].cpu().numpy()
+                    sub_extr_4x4 = np.zeros((V, 4, 4), dtype=np.float32)
+                    sub_extr_4x4[:, :3, :4] = sub_extr
+                    sub_extr_4x4[:, 3, 3] = 1.0
+                    sub_pred = model.inference(
+                        sub_imgs,
+                        extrinsics=sub_extr_4x4,
+                        intrinsics=sub_intr,
+                        process_res=process_res,
+                        align_to_input_ext_scale=True,
+                        ref_view_strategy="saddle_balanced"
+                    )
+                    sub_depths.append(sub_pred.depth)
+                pred_depth_np = np.concatenate(sub_depths, axis=0)
             
-            pred_depth_tensor = torch.from_numpy(pred.depth).unsqueeze(1) # [V * curr_chunk_size, 1, H_out, W_out]
+            pred_depth_tensor = torch.from_numpy(pred_depth_np).unsqueeze(1).float() # [V * curr_chunk_size, 1, H_out, W_out]
             
+            if depths_raw_arr is None:
+                _, _, H_out, W_out = pred_depth_tensor.shape
+                depths_raw_arr = torch.empty((V, T, H_out, W_out), dtype=torch.float32)
+
             pred_depth_resized = F.interpolate(
                 pred_depth_tensor, 
                 size=(H, W), 
@@ -1077,10 +1107,13 @@ def _ensure_da3_aligned_cache_and_load(
             for t in range(t_start, t_end):
                 for v in range(V):
                     depths_arr[v, t] = pred_depth_resized[idx]
+                    depths_raw_arr[v, t] = pred_depth_tensor[idx, 0]
                     idx += 1
 
     # 儲存快取
     # np.save(f_depths, depths_arr.numpy())
+    # if depths_raw_arr is not None:
+    #     np.save(f_depths_raw, depths_raw_arr.numpy())
 
     # 釋放記憶體給後續的 MVTracker
     del model
@@ -1088,4 +1121,5 @@ def _ensure_da3_aligned_cache_and_load(
     gc.collect()
 
     confs_arr = torch.full((V, T, H, W), 100.0, dtype=torch.float32)
-    return depths_arr.unsqueeze(2), confs_arr.unsqueeze(2), intrs_gt.clone(), extrs_gt.clone()
+    depths_raw_out = depths_raw_arr.unsqueeze(2) if depths_raw_arr is not None else None
+    return depths_arr.unsqueeze(2), confs_arr.unsqueeze(2), intrs_gt.clone(), extrs_gt.clone(), depths_raw_out

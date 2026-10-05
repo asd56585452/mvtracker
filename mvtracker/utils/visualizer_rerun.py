@@ -56,6 +56,7 @@ def log_pointclouds_to_rerun(
         log_camera_frustrum: bool = True,
         log_rgb_pointcloud: bool = True,
         timesteps_to_log: Optional[List[int]] = None,
+        raw_pointcloud_max_frames: Optional[int] = None,
 ):
     # Set the up-axis for the world
     # Log coordinate axes for reference
@@ -125,7 +126,7 @@ def log_pointclouds_to_rerun(
             rgb_colors = rgb_image.reshape(-1, 3).astype(np.uint8)
 
             # Log point clouds
-            if log_rgb_pointcloud:
+            if log_rgb_pointcloud and (raw_pointcloud_max_frames is None or t < raw_pointcloud_max_frames):
                 # Filter out points with zero depth
                 valid_mask = depth_values > 0
 
