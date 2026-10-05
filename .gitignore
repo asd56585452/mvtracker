@@ -24,3 +24,9 @@ mask*.jpg
 /output_da3_gs
 /mvtracker_results
 .vscode/
+/results
+*.ply
+pointcloud_benchmark*
+*.csv
+*.json
+!package*.json
