@@ -30,6 +30,7 @@ from mvtracker.utils.spatial_voxelizer import (
     voxel_downsample_unified_with_features,
 )
 from mvtracker.utils.camera_selection import select_cams_by_da3_surfel, select_cams_by_fps
+from mvtracker.datasets.generic_scene_dataset import enable_da3_layer_offload
 
 ALL_SCENES = [
     "coffee_martini",
@@ -187,14 +188,17 @@ def process_scene_frame(
     da3_model,
     device: str,
     budgets: list,
-    weights_path: str,
+    weights_path: str = None,
     num_cams: int = 5,
-    cam_select_mode: str = "da3_surfel",
-    da3_model_name: str = "depth-anything/DA3-LARGE-1.1",
-    process_res: int = 672,
+    cam_select_mode: str = "fps",
+    da3_model_name: str = "depth-anything/DA3-GIANT-1.1",
+    process_res: int = 728,
     conf_thresh: float = 5.0,
+    conf_filter_mode: str = "2d",
     conf_agg: str = "min",
-    overwrite: bool = False
+    colmap_strategy: str = "decoupled",
+    overwrite: bool = False,
+    export_full: bool = False
 ):
     scene_dir = os.path.join(PROJECT_ROOT, "datasets", scene_name)
     colmap_frame_dir = os.path.join(scene_dir, f"colmap_{frame_idx}")
@@ -202,17 +206,25 @@ def process_scene_frame(
         print(f"⚠️ 找不到 {colmap_frame_dir}，跳過！")
         return
 
-    # 檢查目標點雲是否都已存在 (包含 Importance 與 Uniform)
+    # 檢查目標點雲是否都已存在
     needed_budgets = []
     for b in budgets:
         b_str = f"{b // 1000}k" if (b % 1000 == 0 and b >= 1000) else str(b)
-        out_ply_imp = os.path.join(colmap_frame_dir, f"da3_importance_{b_str}.ply")
-        out_ply_uni = os.path.join(colmap_frame_dir, f"da3_uniform_{b_str}.ply")
-        if overwrite or not os.path.exists(out_ply_imp) or not os.path.exists(out_ply_uni):
+        if colmap_strategy == "decoupled":
+            out_ply_target = os.path.join(colmap_frame_dir, f"da3_giant_colmap_importance_{b_str}.ply")
+            if b in (14000, 7330):
+                out_7k = os.path.join(colmap_frame_dir, "da3_giant_colmap_importance_7k.ply")
+                out_uni = os.path.join(colmap_frame_dir, f"da3_giant_colmap_uniform_{b_str}.ply")
+                if overwrite or not (os.path.exists(out_ply_target) and os.path.exists(out_7k) and os.path.exists(out_uni)):
+                    needed_budgets.append(b)
+                continue
+        else:
+            out_ply_target = os.path.join(colmap_frame_dir, f"da3_importance_{b_str}.ply")
+        if overwrite or not os.path.exists(out_ply_target):
             needed_budgets.append(b)
 
     if not needed_budgets:
-        print(f"⏩ [{scene_name} | Frame {frame_idx:03d}] 所有點雲 (Importance & Uniform) 已存在，跳過。")
+        print(f"⏩ [{scene_name} | Frame {frame_idx:03d}] 所有目標點雲已存在，跳過。")
         return
 
     # 載入相機參數與視角
@@ -223,7 +235,7 @@ def process_scene_frame(
     view_dirs = sorted([
         os.path.join(scene_dir, d) for d in os.listdir(scene_dir)
         if os.path.isdir(os.path.join(scene_dir, d)) and d.startswith('cam')
-    ])
+    ], key=lambda x: int("".join(filter(str.isdigit, os.path.basename(x)))))
     num_views = len(view_dirs)
 
     first_frame_path = get_sorted_frame_paths(view_dirs[0])[0]
@@ -238,91 +250,118 @@ def process_scene_frame(
     all_w2c_np = np.stack(all_w2c)
     all_intrs_np = np.stack(all_intrs)
 
-    # 選擇訓練相機 (排除 cam00 測試視角，遵循 prepare_n3d_mvtracker_track 規範)
-    if cam_select_mode == "da3_surfel":
-        selected_cams = select_cams_by_da3_surfel(
-            view_dirs=view_dirs,
-            all_w2c_np=all_w2c_np,
-            all_intrs_np=all_intrs_np,
-            num_to_select=num_cams,
-            voxel_size=0.2,
-            exclude_indices=[0],
-            da3_model=da3_model_name,
-            process_res=process_res,
-            device=device,
-        )
-    else:
-        selected_cams = select_cams_by_fps(all_w2c_np, num_to_select=num_cams, alpha=0.8, exclude_indices=[0])
+    # 選擇訓練相機 (每個場景僅在第 0 幀計算一次並快取，排除 cam00 測試視角)
+    global _SCENE_CAMS_CACHE
+    if "_SCENE_CAMS_CACHE" not in globals():
+        _SCENE_CAMS_CACHE = {}
 
-    # 載入權重設定
-    with open(weights_path, 'r') as f:
-        w_cfg = json.load(f)
-    feat_weights = w_cfg.get("optimal_weights", {
-        "w_0": 0.1513, "w_sobel": 0.3402, "w_dct": 0.3714, "w_chroma": 0.1371, "w_colmap": 0.0
-    })
-    q_global = w_cfg.get("q_global", {
-        "s_sobel": 0.1936, "s_dct": 1.8779, "s_chroma": 0.0473
-    })
+    cache_key = (scene_name, cam_select_mode, num_cams)
+    if cache_key in _SCENE_CAMS_CACHE:
+        selected_cams = _SCENE_CAMS_CACHE[cache_key]
+    else:
+        if cam_select_mode == "da3_surfel":
+            selected_cams = select_cams_by_da3_surfel(
+                view_dirs=view_dirs,
+                all_w2c_np=all_w2c_np,
+                all_intrs_np=all_intrs_np,
+                num_to_select=num_cams,
+                voxel_size=0.2,
+                exclude_indices=[0],
+                da3_model=da3_model_name,
+                process_res=process_res,
+                device=device,
+            )
+        else:
+            selected_cams = select_cams_by_fps(all_w2c_np, num_to_select=num_cams, alpha=0.8, exclude_indices=[0])
+        _SCENE_CAMS_CACHE[cache_key] = selected_cams
+
+    # 載入權重設定 (支援自動探索)
+    if weights_path is None or not os.path.isfile(weights_path):
+        candidate_weights = [
+            os.path.join(scene_dir, f"weights_{scene_name}_f{frame_idx}_giant_2d5.0_4feat.json"),
+            os.path.join(scene_dir, f"weights_{scene_name}_f25_giant_2d5.0_4feat.json"),
+            os.path.join(scene_dir, f"weights_{scene_name}_f{frame_idx}_surfel.json"),
+            os.path.join(scene_dir, f"weights_{scene_name}_f25_surfel.json"),
+        ]
+        weights_path = None
+        for cw in candidate_weights:
+            if os.path.isfile(cw):
+                weights_path = cw
+                break
+
+    if weights_path and os.path.isfile(weights_path):
+        print(f"📖 [{scene_name} | Frame {frame_idx:03d}] 讀取特徵權重檔: {weights_path}")
+        with open(weights_path, 'r') as f:
+            w_cfg = json.load(f)
+        feat_weights = w_cfg.get("optimal_weights", {
+            "w_0": 0.1181, "w_sobel": 0.4352, "w_dct": 0.2486, "w_chroma": 0.1981
+        })
+        q_global = w_cfg.get("q_global", {
+            "s_sobel": 0.2878, "s_dct": 3.1797, "s_chroma": 0.0616
+        })
+    else:
+        print(f"⚙️ [{scene_name} | Frame {frame_idx:03d}] 使用預設 DA3-GIANT 4 項最佳特徵權重")
+        feat_weights = {
+            "w_0": 0.1181, "w_sobel": 0.4352, "w_dct": 0.2486, "w_chroma": 0.1981
+        }
+        q_global = {
+            "s_sobel": 0.2878, "s_dct": 3.1797, "s_chroma": 0.0616
+        }
 
     # 讀取當前幀影像
-    TARGET_W, TARGET_H = 768, 576
-    scale_x = TARGET_W / W_img
-    scale_y = TARGET_H / H_img
-
-    cam_imgs = []
+    cam_imgs_full = []
     cam_w2c = []
-    cam_intr = []
+    cam_intr_orig = []
 
     for cam_idx in selected_cams:
         cam_dir = view_dirs[cam_idx]
         frame_files = get_sorted_frame_paths(cam_dir)
         if frame_idx >= len(frame_files):
             raise IndexError(f"Frame {frame_idx} 超出相機 {cam_dir} 的總幀數 ({len(frame_files)})")
-        img = Image.open(frame_files[frame_idx]).convert('RGB')
-        img_res = img.resize((TARGET_W, TARGET_H), Image.Resampling.BILINEAR)
-        cam_imgs.append(np.array(img_res))
+        img_full = Image.open(frame_files[frame_idx]).convert('RGB')
+        cam_imgs_full.append(img_full)
+        cam_w2c.append(all_w2c_np[cam_idx])
+        cam_intr_orig.append(all_intrs_np[cam_idx].copy())
 
-        w2c = all_w2c_np[cam_idx]
-        K = all_intrs_np[cam_idx].copy()
-        K[0, :] *= scale_x
-        K[1, :] *= scale_y
-
-        cam_w2c.append(w2c)
-        cam_intr.append(K)
-
-    # 執行 DA3 深度推論 (帶相機內外參)
+    # 執行 DA3 深度推論 (使用完整原生解析度影像與原始相機內參，嚴禁提前縮圖破壞信心度)
     extr_chunk = np.stack(cam_w2c, axis=0)
-    intr_chunk = np.stack(cam_intr, axis=0)
+    intr_chunk_orig = np.stack(cam_intr_orig, axis=0)
     extr_4x4 = np.zeros((num_cams, 4, 4), dtype=np.float32)
     extr_4x4[:, :3, :4] = extr_chunk
     extr_4x4[:, 3, 3] = 1.0
 
-    print(f"🚀 [{scene_name} | Frame {frame_idx:03d}] 執行 DA3 深度推論 (5 視角)...")
+    print(f"🚀 [{scene_name} | Frame {frame_idx:03d}] 執行 DA3 深度推論 (原生解析度 {W_img}x{H_img}, 5 視角, res={process_res})...")
     with torch.no_grad():
         pred = da3_model.inference(
-            cam_imgs,
+            image=cam_imgs_full,
             extrinsics=extr_4x4,
-            intrinsics=intr_chunk,
+            intrinsics=intr_chunk_orig,
             process_res=process_res,
             align_to_input_ext_scale=True,
-            ref_view_strategy="saddle_balanced"
+            infer_gs=False,
         )
-        # 轉成 Tensor 並插值回 TARGET_H, TARGET_W
-        pred_depth_tensor = torch.from_numpy(pred.depth).unsqueeze(1).float()  # [V, 1, H_raw, W_raw]
-        _, _, H_raw, W_raw = pred_depth_tensor.shape
-        pred_depth_resized = F.interpolate(pred_depth_tensor, size=(TARGET_H, TARGET_W), mode='nearest').squeeze(1)
-        depths_np = pred_depth_resized.numpy()  # [V, TARGET_H, TARGET_W]
+        depths_raw = pred.depth.astype(np.float32)  # [V, H_proc, W_proc]
+        confs_raw = pred.conf.astype(np.float32) if (hasattr(pred, 'conf') and pred.conf is not None) else np.ones_like(depths_raw, dtype=np.float32) * 10.0
 
-        # 處理信心度，使用與深度圖 100% 一致之 mode='nearest' 解析度縮放
-        if hasattr(pred, 'conf') and pred.conf is not None:
-            pred_conf_tensor = torch.from_numpy(pred.conf).unsqueeze(1).float()
-            pred_conf_resized = F.interpolate(pred_conf_tensor, size=(TARGET_H, TARGET_W), mode='nearest').squeeze(1)
-            confs_np = pred_conf_resized.numpy()
-        else:
-            confs_np = np.ones_like(depths_np, dtype=np.float32) * 10.0
+    _, H_proc, W_proc = depths_raw.shape
+    print(f"📐 [{scene_name} | Frame {frame_idx:03d}] DA3 原生輸出解析度: {W_proc}x{H_proc} (無額外插值)")
 
-    # 特徵分數計算與法向量提取
-    imgs_tensor = torch.from_numpy(np.stack(cam_imgs)).permute(0, 3, 1, 2).float() / 255.0  # [V, 3, H, W]
+    depths_np = depths_raw
+    confs_np = confs_raw
+
+    scale_x = W_proc / W_img
+    scale_y = H_proc / H_img
+    cam_intr_scaled = []
+    cam_imgs_target = []
+    for v in range(num_cams):
+        K_s = cam_intr_orig[v].copy()
+        K_s[0, :] *= scale_x
+        K_s[1, :] *= scale_y
+        cam_intr_scaled.append(K_s)
+        cam_imgs_target.append(np.array(cam_imgs_full[v].resize((W_proc, H_proc), Image.Resampling.BILINEAR)))
+
+    # 特徵分數計算與法向量提取 (全流程原生 W_proc x H_proc，無任何深度插值失真)
+    imgs_tensor = torch.from_numpy(np.stack(cam_imgs_target)).permute(0, 3, 1, 2).float() / 255.0  # [V, 3, H_proc, W_proc]
     feature_scorer = RGBTextureScorer(normalize=False)
 
     with torch.no_grad():
@@ -335,26 +374,27 @@ def process_scene_frame(
         dct_scaled = torch.clamp(s_dct / max(q_global["s_dct"], 1e-4), 0.0, 1.0).numpy()
         chr_scaled = torch.clamp(s_chr / max(q_global["s_chroma"], 1e-4), 0.0, 1.0).numpy()
 
-        # 在原生解析度下計算法向量，再雙線性插值回 TARGET_H, TARGET_W，徹底消除階梯狀偽影
-        intrs_raw = torch.from_numpy(intr_chunk).clone().to(device)
-        intrs_raw[:, 0, :] *= (float(W_raw) / float(TARGET_W))
-        intrs_raw[:, 1, :] *= (float(H_raw) / float(TARGET_H))
-        normals_raw, _ = depth_to_surface_normals(pred_depth_tensor.to(device), intrinsics=intrs_raw, method="min_gradient")
-        normals_torch = F.interpolate(normals_raw, size=(TARGET_H, TARGET_W), mode="bilinear", align_corners=False)
-        normals_torch = F.normalize(normals_torch, dim=1, eps=1e-6)
-        normals_np = normals_torch.permute(0, 2, 3, 1).cpu().numpy()
+        intrs_proc_tensor = torch.from_numpy(np.stack(cam_intr_scaled)).clone().float().to(device)
+        pred_depth_tensor = torch.from_numpy(depths_np).unsqueeze(1).to(device)
+        normals_raw, _ = depth_to_surface_normals(pred_depth_tensor, intrinsics=intrs_proc_tensor, method="min_gradient")
+        normals_torch = F.normalize(normals_raw, dim=1, eps=1e-6)
+        normals_np = normals_torch.permute(0, 2, 3, 1).cpu().numpy()  # [V, H_proc, W_proc, 3]
 
-    # 多視角 3D 逆投影 (保留各像素信心度攜帶至 3D 點)
+    # 多視角 3D 逆投影 (支援 2D 前置信心度過濾)
     pts_all, cols_all, feats_all, fps_all, norms_all, confs_all = [], [], [], [], [], []
     for v in range(num_cams):
-        rgb_v = cam_imgs[v]
+        rgb_v = cam_imgs_target[v]
         d_v = depths_np[v]
+        c_v = confs_np[v]
         feat_v = np.stack([sob_scaled[v], dct_scaled[v], chr_scaled[v]], axis=-1)
-        K_v = cam_intr[v]
+        K_v = cam_intr_scaled[v]
         c2w_v = np.linalg.inv(extr_4x4[v])
         norm_v = normals_np[v]
 
         valid_mask_v = (d_v > 0.1) & (d_v < 150.0) & np.isfinite(d_v)
+        if conf_filter_mode == "2d":
+            valid_mask_v = valid_mask_v & (c_v >= conf_thresh)
+
         pts_w, cols_w, feats_w, fps_w, norms_w, confs_w = unproject_camera_points_with_features(
             rgb=rgb_v,
             depth=d_v,
@@ -366,7 +406,7 @@ def process_scene_frame(
             valid_mask=valid_mask_v,
             normals=norm_v,
             return_normals=True,
-            confidences=confs_np[v],
+            confidences=c_v,
             return_confidences=True,
         )
         pts_all.append(pts_w)
@@ -383,7 +423,7 @@ def process_scene_frame(
     norms_cat = np.concatenate(norms_all, axis=0)
     confs_cat = np.concatenate(confs_all, axis=0)
 
-    # 載入 COLMAP 稀疏點雲
+    # 載入 COLMAP 稀疏點雲 (解耦架構下保留原汁原味，不參與體素融合)
     colmap_candidates = [
         os.path.join(scene_dir, f"colmap_{frame_idx}", "sparse", "0", "points3D.bin"),
         os.path.join(scene_dir, f"colmap_{frame_idx}", "sparse", "0", "points3D.ply"),
@@ -397,18 +437,49 @@ def process_scene_frame(
             colmap_path = cp
             break
 
+    colmap_pts = np.zeros((0, 3), dtype=np.float32)
+    colmap_cols = np.zeros((0, 3), dtype=np.uint8)
     has_colmap = False
     if colmap_path is not None:
         try:
             colmap_pts, colmap_cols = load_colmap_points(colmap_path)
-            print(f"📌 [{scene_name} | Frame {frame_idx:03d}] 成功載入 COLMAP 稀疏點雲: {len(colmap_pts):,} 點 ({colmap_path})")
+            has_colmap = True
+            print(f"📌 [{scene_name} | Frame {frame_idx:03d}] 成功載入 COLMAP 稀疏錨點: {len(colmap_pts):,} 點 ({colmap_path})")
+        except Exception as e:
+            print(f"⚠️ 載入 COLMAP 點雲失敗 ({colmap_path}): {e}")
 
+    # 體素融合
+    if colmap_strategy == "decoupled":
+        # 純淨 DA3 點雲進行體素化
+        v_pts, v_cols, v_feats, _, v_confs = voxel_downsample_unified_with_features(
+            pts=pts_cat,
+            colors=cols_cat,
+            features=feats_cat,
+            normals=norms_cat,
+            voxel_size=0.1,
+            footprints=fps_cat,
+            min_voxel_size=0.01,
+            scale=1.0,
+            mode="surfel",
+            surfel_normal_scale=5.0,
+            surfel_angle_deg=25.0,
+            confidences=confs_cat,
+            conf_agg=conf_agg,
+            return_confidences=True,
+        )
+        if conf_filter_mode == "3d":
+            valid_vox_mask = (v_confs >= conf_thresh)
+            v_pts = v_pts[valid_vox_mask]
+            v_cols = v_cols[valid_vox_mask]
+            v_feats = v_feats[valid_vox_mask]
+    else:
+        # Legacy 耦合模式
+        if has_colmap:
             cams_pos = np.stack([np.linalg.inv(extr)[:3, 3] for extr in extr_4x4])
             dists_col_cams = np.linalg.norm(colmap_pts[:, None, :] - cams_pos[None, :, :], axis=-1)
             min_dists = dists_col_cams.min(axis=-1)
             avg_focal = 0.5 * (intr_chunk[:, 0, 0].mean() + intr_chunk[:, 1, 1].mean())
             footprints_col = np.clip(min_dists / avg_focal, 0.01, 0.1).astype(np.float32)
-
             norms_col = assign_normals_to_colmap_points(
                 colmap_pts=colmap_pts,
                 da3_pts=pts_cat,
@@ -416,67 +487,41 @@ def process_scene_frame(
                 cams_pos=cams_pos,
                 max_nn_dist=0.15
             )
-
             pts_col_normed = (colmap_cols / 255.0).astype(np.float32) if colmap_cols.max() > 1.0 else colmap_cols.astype(np.float32)
             feats_col = np.zeros((len(colmap_pts), 3), dtype=np.float32)
             confs_col = np.full(len(colmap_pts), 20.0, dtype=np.float32)
-
             pts_cat = np.concatenate([pts_cat, colmap_pts], axis=0)
             cols_cat = np.concatenate([cols_cat, pts_col_normed], axis=0)
             feats_cat = np.concatenate([feats_cat, feats_col], axis=0)
             fps_cat = np.concatenate([fps_cat, footprints_col], axis=0)
             norms_cat = np.concatenate([norms_cat, norms_col], axis=0)
             confs_cat = np.concatenate([confs_cat, confs_col], axis=0)
-            has_colmap = True
-        except Exception as e:
-            print(f"⚠️ 載入 COLMAP 點雲失敗 ({colmap_path}): {e}，僅使用 DA3 點雲")
 
-    # 體素融合 (Surfel Mode - 遵循 prepare_n3d 規範，傳入 footprints 動態足跡與信心度)
-    v_pts, v_cols, v_feats, _, v_confs = voxel_downsample_unified_with_features(
-        pts=pts_cat,
-        colors=cols_cat,
-        features=feats_cat,
-        normals=norms_cat,
-        voxel_size=0.1,
-        footprints=fps_cat,
-        min_voxel_size=0.01,
-        scale=1.0,
-        mode="surfel",
-        surfel_normal_scale=5.0,
-        surfel_angle_deg=25.0,
-        confidences=confs_cat,
-        conf_agg=conf_agg,
-        return_confidences=True,
-    )
-
-    raw_M = len(v_pts)
-    print(f"📊 [{scene_name} | Frame {frame_idx:03d}] 體素下採樣初始點數: {raw_M:,}")
-
-    # 體素信心度過濾 (刪除低於門檻之體素，消除窗戶/室外虛假偽影)
-    valid_vox_mask = (v_confs >= conf_thresh)
-    del_cnt = np.sum(~valid_vox_mask)
-    print(f"🧹 依據體素信心度門檻 (conf_thresh >= {conf_thresh}, agg={conf_agg.upper()}): 刪除 {del_cnt:,} 個體素 ({del_cnt/raw_M*100:.1f}%)")
-
-    v_pts = v_pts[valid_vox_mask]
-    v_cols = v_cols[valid_vox_mask]
-    v_feats = v_feats[valid_vox_mask]
+        v_pts, v_cols, v_feats, _, v_confs = voxel_downsample_unified_with_features(
+            pts=pts_cat,
+            colors=cols_cat,
+            features=feats_cat,
+            normals=norms_cat,
+            voxel_size=0.1,
+            footprints=fps_cat,
+            min_voxel_size=0.01,
+            scale=1.0,
+            mode="surfel",
+            surfel_normal_scale=5.0,
+            surfel_angle_deg=25.0,
+            confidences=confs_cat,
+            conf_agg=conf_agg,
+            return_confidences=True,
+        )
+        valid_vox_mask = (v_confs >= conf_thresh)
+        v_pts = v_pts[valid_vox_mask]
+        v_cols = v_cols[valid_vox_mask]
+        v_feats = v_feats[valid_vox_mask]
 
     M = len(v_pts)
-    print(f"📊 [{scene_name} | Frame {frame_idx:03d}] 體素下採樣後候選點數: {M:,}")
+    print(f"📊 [{scene_name} | Frame {frame_idx:03d}] 純淨 DA3 體素候選點數: {M:,}")
 
-    # 統計各體素 COLMAP 點數分數
-    if has_colmap:
-        tree_v = cKDTree(v_pts)
-        search_r_col = 0.15
-        dists_col, matched_vox_col = tree_v.query(colmap_pts, k=1, distance_upper_bound=search_r_col)
-        valid_col = dists_col < search_r_col
-        colmap_counts = np.bincount(matched_vox_col[valid_col], minlength=M).astype(np.float32)
-        p_col = colmap_counts / max(np.sum(colmap_counts), 1e-12)
-        print(f"   包含 COLMAP 點的體素數: {np.sum(colmap_counts > 0):,} / {M:,}")
-    else:
-        p_col = np.zeros(M, dtype=np.float32)
-
-    # 重要度採樣機率分佈 (5 項權重: w_0, w_sobel, w_dct, w_chroma, w_colmap)
+    # 機率分佈計算
     s_sob_v = v_feats[:, 0]
     s_dct_v = v_feats[:, 1]
     s_chr_v = v_feats[:, 2]
@@ -486,19 +531,34 @@ def process_scene_frame(
     p_dct = s_dct_v / max(np.sum(s_dct_v), 1e-12)
     p_chr = s_chr_v / max(np.sum(s_chr_v), 1e-12)
 
-    w_0 = feat_weights.get("w_0", 0.1)
-    w_sob = feat_weights.get("w_sobel", 0.2)
-    w_dct = feat_weights.get("w_dct", 0.2)
-    w_chr = feat_weights.get("w_chroma", 0.1)
-    w_col = feat_weights.get("w_colmap", 0.4 if has_colmap else 0.0)
+    w_0 = feat_weights.get("w_0", 0.1181)
+    w_sob = feat_weights.get("w_sobel", 0.4352)
+    w_dct = feat_weights.get("w_dct", 0.2486)
+    w_chr = feat_weights.get("w_chroma", 0.1981)
 
-    p_k = (
-        w_0 * p_base +
-        w_sob * p_sob +
-        w_dct * p_dct +
-        w_chr * p_chr +
-        w_col * p_col
-    )
+    if colmap_strategy == "decoupled":
+        p_k = (
+            w_0 * p_base +
+            w_sob * p_sob +
+            w_dct * p_dct +
+            w_chr * p_chr
+        )
+    else:
+        tree_v = cKDTree(v_pts)
+        search_r_col = 0.15
+        dists_col, matched_vox_col = tree_v.query(colmap_pts, k=1, distance_upper_bound=search_r_col)
+        valid_col = dists_col < search_r_col
+        colmap_counts = np.bincount(matched_vox_col[valid_col], minlength=M).astype(np.float32)
+        p_col = colmap_counts / max(np.sum(colmap_counts), 1e-12)
+        w_col = feat_weights.get("w_colmap", 0.4 if has_colmap else 0.0)
+        p_k = (
+            w_0 * p_base +
+            w_sob * p_sob +
+            w_dct * p_dct +
+            w_chr * p_chr +
+            w_col * p_col
+        )
+
     p_sum = p_k.sum()
     if p_sum > 0:
         p_k /= p_sum
@@ -508,34 +568,79 @@ def process_scene_frame(
     p_torch = torch.from_numpy(p_k).float()
     v_cols_u8 = (np.clip(v_cols, 0.0, 1.0) * 255).astype(np.uint8) if v_cols.max() <= 1.0 else v_cols.astype(np.uint8)
 
-    # 匯出完整候選點雲 (Full Candidate Surfels)
-    out_ply_full = os.path.join(colmap_frame_dir, "da3_full.ply")
-    if overwrite or not os.path.exists(out_ply_full):
-        save_ply(out_ply_full, v_pts, v_cols_u8)
-        print(f"  ✅ 成功匯出 (Full Surfel): {out_ply_full} ({M:,} 點)")
+    # 匯出完整候選點雲 (選用，預設不匯出以節省硬碟空間)
+    if export_full:
+        out_ply_full = os.path.join(colmap_frame_dir, "da3_full.ply")
+        if overwrite or not os.path.exists(out_ply_full):
+            save_ply(out_ply_full, v_pts, v_cols_u8)
+            print(f"  ✅ 成功匯出 (Full Surfel): {out_ply_full} ({M:,} 點)")
 
-    # 匯出各預算點雲 (包含 Importance 與 Uniform 消融對照)
+    # 匯出各預算點雲
     for b in budgets:
         b_str = f"{b // 1000}k" if (b % 1000 == 0 and b >= 1000) else str(b)
-        k_sample = min(b, M)
 
-        # 1. 特徵重要度採樣點雲 (Importance Sampling)
-        out_ply_imp = os.path.join(colmap_frame_dir, f"da3_importance_{b_str}.ply")
-        if overwrite or not os.path.exists(out_ply_imp):
+        if colmap_strategy == "decoupled":
+            # 解耦架構: COLMAP 100% 保留，剩餘預算由 DA3 體素補充
+            num_col = len(colmap_pts)
+            needed_da3 = max(0, b - num_col)
+            k_sample = min(needed_da3, M)
             sampled_indices = torch.multinomial(p_torch, num_samples=k_sample, replacement=False).numpy()
-            sampled_pts = v_pts[sampled_indices]
-            sampled_cols = v_cols_u8[sampled_indices]
-            save_ply(out_ply_imp, sampled_pts, sampled_cols)
-            print(f"  ✅ 成功匯出 (Importance): {out_ply_imp} ({len(sampled_pts):,} 點)")
+            da3_sampled_pts = v_pts[sampled_indices]
+            da3_sampled_cols = v_cols_u8[sampled_indices]
 
-        # 2. 均勻隨機採樣點雲 (Uniform Sampling 消融組)
-        out_ply_uni = os.path.join(colmap_frame_dir, f"da3_uniform_{b_str}.ply")
-        if overwrite or not os.path.exists(out_ply_uni):
-            uni_indices = np.random.choice(M, size=k_sample, replace=False)
-            uni_pts = v_pts[uni_indices]
-            uni_cols = v_cols_u8[uni_indices]
-            save_ply(out_ply_uni, uni_pts, uni_cols)
-            print(f"  ✅ 成功匯出 (Uniform):    {out_ply_uni} ({len(uni_pts):,} 點)")
+            colmap_cols_u8 = (np.clip(colmap_cols, 0.0, 1.0) * 255).astype(np.uint8) if colmap_cols.max() <= 1.0 else colmap_cols.astype(np.uint8)
+
+            final_pts = np.concatenate([colmap_pts, da3_sampled_pts], axis=0)
+            final_cols = np.concatenate([colmap_cols_u8, da3_sampled_cols], axis=0)
+
+            out_ply_giant = os.path.join(colmap_frame_dir, f"da3_giant_colmap_importance_{b_str}.ply")
+            if overwrite or not os.path.exists(out_ply_giant):
+                save_ply(out_ply_giant, final_pts, final_cols)
+                print(f"  ✅ 成功匯出 (Decoupled {b_str}): {out_ply_giant} ({len(final_pts):,} 點: {num_col} COLMAP + {k_sample} DA3)")
+
+            # 同步匯出 Uniform 消融組: COLMAP 全量 + k_sample DA3 Uniform 採樣
+            out_ply_giant_uni = os.path.join(colmap_frame_dir, f"da3_giant_colmap_uniform_{b_str}.ply")
+            if overwrite or not os.path.exists(out_ply_giant_uni):
+                uni_indices = np.random.choice(M, size=k_sample, replace=False)
+                final_pts_uni = np.concatenate([colmap_pts, v_pts[uni_indices]], axis=0)
+                final_cols_uni = np.concatenate([colmap_cols_u8, v_cols_u8[uni_indices]], axis=0)
+                save_ply(out_ply_giant_uni, final_pts_uni, final_cols_uni)
+                print(f"  ✅ 成功匯出 (Decoupled Uniform {b_str}): {out_ply_giant_uni} ({len(final_pts_uni):,} 點)")
+
+            # 若預算為 14000 (14k)，同步產出 Group B: COLMAP 砍半 (~3.5k) + 3.5k DA3 Importance (總計約 7k 點)
+            if b == 14000 or b == 7330:
+                col_half_pts = colmap_pts[::2]
+                col_half_cols = colmap_cols_u8[::2]
+                k_half = max(0, 7000 - len(col_half_pts))
+                sampled_half_indices = torch.multinomial(p_torch, num_samples=k_half, replacement=False).numpy()
+                final_pts_half = np.concatenate([col_half_pts, v_pts[sampled_half_indices]], axis=0)
+                final_cols_half = np.concatenate([col_half_cols, v_cols_u8[sampled_half_indices]], axis=0)
+                out_ply_giant_7k = os.path.join(colmap_frame_dir, "da3_giant_colmap_importance_7k.ply")
+                if overwrite or not os.path.exists(out_ply_giant_7k):
+                    save_ply(out_ply_giant_7k, final_pts_half, final_cols_half)
+                    print(f"  ✅ 成功匯出 (Decoupled 7k, COLMAP砍半): {out_ply_giant_7k} ({len(final_pts_half):,} 點: {len(col_half_pts)} COLMAP + {k_half} DA3)")
+
+            # 同步更新 da3_importance_{b_str}.ply 作為相容輸出
+            out_ply_imp = os.path.join(colmap_frame_dir, f"da3_importance_{b_str}.ply")
+            if overwrite or not os.path.exists(out_ply_imp):
+                save_ply(out_ply_imp, final_pts, final_cols)
+        else:
+            k_sample = min(b, M)
+            out_ply_imp = os.path.join(colmap_frame_dir, f"da3_importance_{b_str}.ply")
+            if overwrite or not os.path.exists(out_ply_imp):
+                sampled_indices = torch.multinomial(p_torch, num_samples=k_sample, replacement=False).numpy()
+                sampled_pts = v_pts[sampled_indices]
+                sampled_cols = v_cols_u8[sampled_indices]
+                save_ply(out_ply_imp, sampled_pts, sampled_cols)
+                print(f"  ✅ 成功匯出 (Importance): {out_ply_imp} ({len(sampled_pts):,} 點)")
+
+            out_ply_uni = os.path.join(colmap_frame_dir, f"da3_uniform_{b_str}.ply")
+            if overwrite or not os.path.exists(out_ply_uni):
+                uni_indices = np.random.choice(M, size=k_sample, replace=False)
+                uni_pts = v_pts[uni_indices]
+                uni_cols = v_cols_u8[uni_indices]
+                save_ply(out_ply_uni, uni_pts, uni_cols)
+                print(f"  ✅ 成功匯出 (Uniform):    {out_ply_uni} ({len(uni_pts):,} 點)")
 
 
 def main():
@@ -543,13 +648,16 @@ def main():
     parser.add_argument("--scenes", nargs="+", default=ALL_SCENES, help="目標場景名稱")
     parser.add_argument("--frames", nargs="+", type=int, default=TARGET_FRAMES, help="目標幀列表 (預設 25 75 125 175 225 275)")
     parser.add_argument("--budgets", nargs="+", type=int, default=DEFAULT_BUDGETS, help="點數預算 (預設 7330 50000 250000)")
-    parser.add_argument("--cam_select_mode", type=str, choices=["da3_surfel", "fps"], default="da3_surfel", help="相機挑選模式 (預設 da3_surfel，與 prepare_n3d 對齊)")
+    parser.add_argument("--cam_select_mode", type=str, choices=["da3_surfel", "fps"], default="fps", help="相機挑選模式 (預設 fps)")
     parser.add_argument("--overwrite", action="store_true", help="強制重新生成已存在的點雲")
-    parser.add_argument("--weights_json", type=str, default="datasets/sear_steak/weights_sear_steak_f0_surfel.json", help="特徵權重 JSON 檔")
-    parser.add_argument("--conf_thresh", type=float, default=5.0, help="體素信心度門檻 (低於此值刪除體素，預設 5.0)")
+    parser.add_argument("--weights_json", type=str, default=None, help="特徵權重 JSON 檔 (預設自動搜尋最佳權重檔)")
+    parser.add_argument("--conf_thresh", type=float, default=5.0, help="體素信心度門檻 (預設 5.0)")
+    parser.add_argument("--conf_filter_mode", type=str, choices=["2d", "3d"], default="2d", help="信心度過濾階段 (預設 2d)")
     parser.add_argument("--conf_agg", type=str, choices=["min", "mean"], default="min", help="體素信心聚合方式: min (多視角最小信心，推薦) 或 mean (多視角平均信心)")
-    parser.add_argument("--da3_model", type=str, default="depth-anything/DA3-LARGE-1.1", help="DA3 模型權重")
-    parser.add_argument("--process_res", type=int, default=672, help="DA3 推理解析度")
+    parser.add_argument("--colmap_strategy", type=str, choices=["decoupled", "coupled", "none"], default="decoupled", help="COLMAP 融合策略 (decoupled: 保留原錨點不參與體素融合)")
+    parser.add_argument("--da3_model", type=str, default="depth-anything/DA3-GIANT-1.1", help="DA3 模型權重")
+    parser.add_argument("--process_res", type=int, default=728, help="DA3 推理解析度 (GIANT 預設 728)")
+    parser.add_argument("--export_full", action="store_true", help="額外匯出未採樣之完整候選體素點雲 da3_full.ply (預設不匯出以節省硬碟空間)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -558,13 +666,22 @@ def main():
     print(f"   場景: {args.scenes}")
     print(f"   幀數: {args.frames}")
     print(f"   點數預算: {args.budgets}")
+    print(f"   COLMAP 策略: {args.colmap_strategy.upper()} (信心過濾: {args.conf_filter_mode.upper()} >= {args.conf_thresh})")
     print(f"   DA3 模型: {args.da3_model} (解析度: {args.process_res})")
-    print(f"   體素信心門檻: {args.conf_thresh} (聚合模式: {args.conf_agg.upper()})")
     print("="*70)
 
     from depth_anything_3.api import DepthAnything3
     print("⏳ 載入 DA3 模型至 GPU...")
-    da3_model = DepthAnything3.from_pretrained(args.da3_model).to(device)
+    if "GIANT" in args.da3_model.upper() and device == "cuda":
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if total_vram_gb <= 16.0:
+            print("⚡ 啟用 DA3-GIANT 動態分層推論 (Sequential Block Offload) 以防顯存溢出...")
+            da3_model = DepthAnything3.from_pretrained(args.da3_model)
+            da3_model = enable_da3_layer_offload(da3_model, device=torch.device(device))
+        else:
+            da3_model = DepthAnything3.from_pretrained(args.da3_model).to(device)
+    else:
+        da3_model = DepthAnything3.from_pretrained(args.da3_model).to(device)
     da3_model.eval()
 
     np.random.seed(72)
@@ -585,13 +702,16 @@ def main():
                     da3_model=da3_model,
                     device=device,
                     budgets=args.budgets,
-                    weights_path=os.path.join(PROJECT_ROOT, args.weights_json),
+                    weights_path=os.path.join(PROJECT_ROOT, args.weights_json) if args.weights_json else None,
                     cam_select_mode=args.cam_select_mode,
                     da3_model_name=args.da3_model,
                     process_res=args.process_res,
                     conf_thresh=args.conf_thresh,
+                    conf_filter_mode=args.conf_filter_mode,
                     conf_agg=args.conf_agg,
-                    overwrite=args.overwrite
+                    colmap_strategy=args.colmap_strategy,
+                    overwrite=args.overwrite,
+                    export_full=args.export_full
                 )
             except Exception as e:
                 print(f"❌ 處理 {scene} f{frame} 失敗: {e}")

@@ -76,8 +76,8 @@ def select_cams_by_da3_surfel(
     num_to_select: int = 5,
     voxel_size: float = 0.2,
     exclude_indices: List[int] = [0],
-    da3_model: str = "depth-anything/DA3-LARGE-1.1",
-    process_res: int = 672,
+    da3_model: str = "depth-anything/DA3-GIANT-1.1",
+    process_res: int = 728,
     device: str = "cuda",
 ) -> List[int]:
     """
@@ -119,11 +119,16 @@ def select_cams_by_da3_surfel(
     # 2. 呼叫 DA3 推論第 0 幀深度
     try:
         from depth_anything_3.api import DepthAnything3
+        from mvtracker.datasets.generic_scene_dataset import enable_da3_layer_offload
     except ImportError:
         print("⚠️ 未安裝 depth_anything_3，自動降級為 FPS 幾何外參選擇。")
         return select_cams_by_fps(all_w2c_np, num_to_select, exclude_indices=exclude_indices)
 
-    print(f"🤖 正在使用 {da3_model} 推論 {len(candidates)} 個候選視角在第 0 幀之幾何深度...")
+    # 相機覆蓋率挑選僅需宏觀幾何與法向，使用 DA3-LARGE (res<=504) 僅耗時 ~4 秒且杜絕 20 視角 VRAM 溢出
+    selection_model = "depth-anything/DA3-LARGE-1.1" if "GIANT" in da3_model.upper() else da3_model
+    selection_res = min(process_res, 504)
+
+    print(f"🤖 正在使用 {selection_model} (res={selection_res}) 推論 {len(candidates)} 個候選視角在第 0 幀之幾何深度...")
     t_infer_start = time.time()
     
     extr_4x4 = np.zeros((len(candidates), 4, 4), dtype=np.float32)
@@ -131,7 +136,8 @@ def select_cams_by_da3_surfel(
     extr_4x4[:, 3, 3] = 1.0
     intr_batch = all_intrs_np[candidates]
 
-    model = DepthAnything3.from_pretrained(da3_model).to(device)
+    dev = torch.device(device)
+    model = DepthAnything3.from_pretrained(selection_model).to(dev)
     model.eval()
 
     amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else torch.float16
@@ -140,7 +146,7 @@ def select_cams_by_da3_surfel(
             images_f0,
             extrinsics=extr_4x4,
             intrinsics=intr_batch,
-            process_res=process_res,
+            process_res=selection_res,
             align_to_input_ext_scale=True,
             ref_view_strategy="saddle_balanced"
         )

@@ -194,20 +194,11 @@ def get_or_compute_frame_depths(
     image_paths: List[str],
     all_w2c: np.ndarray,
     all_intrs: np.ndarray,
-    cache_path: str,
-    model_id: str = "depth-anything/DA3-LARGE-1.1",
-    process_res: int = 672,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """取得或透過 DA3 計算首幀深度圖與信心圖，回傳 (depths, depths_raw, confs, confs_raw)"""
-    if os.path.isfile(cache_path):
-        data = np.load(cache_path)
-        if "depths" in data and "depths_raw" in data and "confs" in data:
-            print(f"📦 命中深度與信心度快取: {cache_path}")
-            confs_raw = data["confs_raw"] if "confs_raw" in data else data["confs"]
-            return data["depths"], data["depths_raw"], data["confs"], confs_raw
-        print(f"⚠️ 快取檔缺少 confs 或 depths_raw，重新執行 DA3 推理以確保法向量與信心度精度...")
-
-    print(f"🚀 未找到有效深度快取，啟動 {model_id} 預測多視角深度與信心 (process_res={process_res})...")
+    model_id: str = "depth-anything/DA3-GIANT-1.1",
+    process_res: int = 728,
+) -> Tuple[np.ndarray, np.ndarray, int, int]:
+    """透過 DA3 即時計算多視角深度圖與信心圖 (不使用硬碟快取，保持原生 process_res 輸出解析度)，回傳 (depths, confs, W_proc, H_proc)"""
+    print(f"🚀 啟動 {model_id} 即時預測多視角深度與信心 (process_res={process_res})...")
     from depth_anything_3.api import DepthAnything3
     from mvtracker.datasets.generic_scene_dataset import enable_da3_layer_offload
 
@@ -225,8 +216,6 @@ def get_or_compute_frame_depths(
     model.eval()
 
     images_pil = [Image.open(p).convert("RGB") for p in image_paths]
-    W_orig, H_orig = images_pil[0].size
-
     num_views = len(images_pil)
     extr_4x4 = np.zeros((num_views, 4, 4), dtype=np.float32)
     extr_4x4[:, :3, :4] = all_w2c
@@ -242,24 +231,16 @@ def get_or_compute_frame_depths(
             process_res=process_res,
         )
 
-    depths_raw = pred.depth.astype(np.float32)  # [V, H_raw, W_raw]
+    depths_raw = pred.depth.astype(np.float32)  # [V, H_proc, W_proc]
     confs_raw = pred.conf.astype(np.float32) if (hasattr(pred, 'conf') and pred.conf is not None) else np.ones_like(depths_raw, dtype=np.float32) * 10.0
-
-    depths_t = torch.from_numpy(depths_raw).unsqueeze(1)
-    depths_resized = F.interpolate(depths_t, size=(H_orig, W_orig), mode="nearest").squeeze(1).numpy()
-
-    # 信心圖採用與深度圖 100% 一致之 mode='nearest' 解析度縮放
-    confs_t = torch.from_numpy(confs_raw).unsqueeze(1)
-    confs_resized = F.interpolate(confs_t, size=(H_orig, W_orig), mode="nearest").squeeze(1).numpy()
+    _, H_proc, W_proc = depths_raw.shape
+    print(f"📐 DA3 原生輸出解析度: {W_proc}x{H_proc} (無額外插值)")
 
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
-    np.savez_compressed(cache_path, depths=depths_resized, depths_raw=depths_raw, confs=confs_resized, confs_raw=confs_raw)
-    print(f"💾 深度與信心度已儲存至快取: {cache_path}")
-    return depths_resized, depths_raw, confs_resized, confs_raw
+    return depths_raw, confs_raw, W_proc, H_proc
 
 
 def main():
@@ -274,16 +255,17 @@ def main():
     parser.add_argument("--surfel_angle_deg", type=float, default=25.0, help="Surfel 模式表面法向夾角門檻 (預設 25.0 度)")
     parser.add_argument("--min_voxel_size", type=float, default=0.01, help="最小體素大小 (預設 0.01)")
     parser.add_argument("--dynamic_voxel_scale", type=float, default=1.0, help="動態足跡縮放係數 (預設 1.0)")
-    parser.add_argument("--target_w", type=int, default=768, help="目標處理寬度 (預設 768，與 Demo 腳本一致)")
-    parser.add_argument("--target_h", type=int, default=576, help="目標處理高度 (預設 576，與 Demo 腳本一致)")
-    parser.add_argument("--num_cams", type=int, default=5, help="參與相機數量 (預設 5，與 Demo 腳本一致)")
-    parser.add_argument("--cam_select_mode", type=str, choices=["da3_surfel", "fps"], default="da3_surfel", help="相機挑選模式: da3_surfel (基於第0幀DA3表面最大覆蓋) 或 fps (外參最遠點採樣)")
+    parser.add_argument("--num_cams", type=int, default=5, help="參與相機數量 (預設 5)")
+    parser.add_argument("--cam_select_mode", type=str, choices=["da3_surfel", "fps"], default="fps", help="相機挑選模式: fps (外參最遠點採樣，預設) 或 da3_surfel (基於第0幀DA3表面最大覆蓋)")
     parser.add_argument("--include_cam00", action="store_true", help="是否包含 cam00 (預設排除 index 0 測試視角)")
-    parser.add_argument("--da3_model", type=str, default="depth-anything/DA3-LARGE-1.1", help="DA3 模型版本 (預設 DA3-LARGE-1.1)")
-    parser.add_argument("--process_res", type=int, default=672, help="DA3 推論解析度 (預設 672)")
-    parser.add_argument("--depth_cache", type=str, default=None, help="深度快取檔路徑 (預設依模型與解析度命名)")
-    parser.add_argument("--conf_thresh", type=float, default=5.0, help="體素信心門檻 (融合後體素信心低於此值刪除，預設 5.0)")
-    parser.add_argument("--conf_agg", type=str, choices=["min", "mean"], default="min", help="體素信心聚合方式: min (多視角最小信心，嚴格濾除偽影) 或 mean (多視角平均信心)")
+    parser.add_argument("--da3_model", type=str, default="depth-anything/DA3-GIANT-1.1", help="DA3 模型版本 (預設 depth-anything/DA3-GIANT-1.1)")
+    parser.add_argument("--process_res", type=int, default=728, help="DA3 推論解析度 (預設 728)")
+    parser.add_argument("--conf_thresh", type=float, default=5.0, help="體素信心門檻 (預設 5.0)")
+    parser.add_argument("--conf_filter_mode", type=str, choices=["2d", "3d"], default="2d", help="信心度過濾階段 (預設 2d)")
+    parser.add_argument("--conf_agg", type=str, choices=["min", "mean"], default="min", help="體素信心聚合方式: min (多視角最小信心) 或 mean (多視角平均信心)")
+    parser.add_argument("--colmap_strategy", type=str, choices=["decoupled", "coupled"], default="decoupled", help="COLMAP 融合策略 (decoupled: 保留原錨點不參與體素融合與權重求解)")
+    parser.add_argument("--target_budget", type=int, default=0, help="輸出點雲目標點數預算 (預設 0，僅當明確指定 --output_ply 時生效)")
+    parser.add_argument("--output_ply", type=str, default=None, help="輸出點雲 PLY 路徑 (預設 None，不輸出 PLY，僅產出權重 JSON)")
     parser.add_argument("--colmap_path", type=str, default=None, help="COLMAP 點雲路徑 (.bin, .ply, .txt，預設自動偵測)")
     parser.add_argument("--output_json", type=str, default=None, help="輸出權重 JSON 路徑 (預設依體素模式自動命名)")
     args = parser.parse_args()
@@ -293,7 +275,8 @@ def main():
 
     if args.output_json is None:
         dataset_name = os.path.basename(os.path.normpath(args.dataset_dir))
-        suffix = f"_{args.voxel_mode}_colmap.json"
+        strategy_tag = "decoupled" if args.colmap_strategy == "decoupled" else "colmap"
+        suffix = f"_{args.voxel_mode}_{strategy_tag}.json"
         args.output_json = os.path.join(args.dataset_dir, f"weights_{dataset_name}_f{args.frame_idx}{suffix}")
 
     print("\n" + "=" * 70)
@@ -316,10 +299,7 @@ def main():
     sample_frames = get_sorted_frame_paths(view_dirs[0])
     test_img = Image.open(sample_frames[args.frame_idx])
     W_orig, H_orig = test_img.size
-    TARGET_W, TARGET_H = args.target_w, args.target_h
-    scale_x = TARGET_W / W_orig
-    scale_y = TARGET_H / H_orig
-    print(f"📷 相機總數: {len(view_dirs)} | 原圖: {W_orig}x{H_orig} | 目標縮放解析度: {TARGET_W}x{TARGET_H}")
+    print(f"📷 相機總數: {len(view_dirs)} | 原圖: {W_orig}x{H_orig} | DA3 process_res: {args.process_res}")
 
     all_w2c_list, all_intrs_list = [], []
     for i in range(len(all_poses_llff)):
@@ -350,52 +330,35 @@ def main():
     else:
         selected_cam_indices = [i for i in range(len(view_dirs)) if i not in exclude_idx]
 
-    cam_tag = f"{args.cam_select_mode}_{len(selected_cam_indices)}cams"
-    if args.depth_cache is None:
-        model_tag = "large" if "large" in args.da3_model.lower() else ("giant" if "giant" in args.da3_model.lower() else "da3")
-        args.depth_cache = os.path.join(args.dataset_dir, f"depth_f{args.frame_idx}_{model_tag}_{cam_tag}_res{args.process_res}.npz")
-
     selected_cams = [view_dirs[i] for i in selected_cam_indices]
     cams_w2c = all_w2c_np[selected_cam_indices]
     cams_intrs = all_intrs_np[selected_cam_indices]
-
-    # 縮放內參以適應 TARGET_W, TARGET_H
-    cams_intrs_scaled = cams_intrs.copy()
-    cams_intrs_scaled[:, 0, :] *= scale_x
-    cams_intrs_scaled[:, 1, :] *= scale_y
-
     cams_c2w = [np.linalg.inv(np.vstack([w2c, [0, 0, 0, 1]])) for w2c in cams_w2c]
 
     print(f"🎯 選定相機視角 (共 {len(selected_cams)} 個): {[os.path.basename(c) for c in selected_cams]}")
 
-    # 2. 取得多視角 RGB 影像與深度
+    # 2. 取得多視角 RGB 影像與原生解析度深度 (無快取、無額外插值)
     frame_img_paths = [get_sorted_frame_paths(d)[args.frame_idx] for d in selected_cams]
-    depths_orig, depths_raw, confs_orig, confs_raw = get_or_compute_frame_depths(
+    depths, confs, W_proc, H_proc = get_or_compute_frame_depths(
         image_paths=frame_img_paths,
         all_w2c=cams_w2c,
         all_intrs=cams_intrs,
-        cache_path=args.depth_cache,
         model_id=args.da3_model,
         process_res=args.process_res,
-    )  # depths_orig: [V, H_orig, W_orig], depths_raw: [V, H_raw, W_raw], confs_orig: [V, H_orig, W_orig]
+    )
 
-    # 將深度縮放至 TARGET_H, TARGET_W (使用 nearest 避免邊緣虛構過渡深度)
-    depths_t = torch.from_numpy(depths_orig).unsqueeze(1).float()
-    depths = F.interpolate(depths_t, size=(TARGET_H, TARGET_W), mode="nearest").squeeze(1).numpy()
-
-    # 將信心度縮放至 TARGET_H, TARGET_W (使用與深度圖完全一致之 nearest 插值)
-    confs_t = torch.from_numpy(confs_orig).unsqueeze(1).float()
-    confs = F.interpolate(confs_t, size=(TARGET_H, TARGET_W), mode="nearest").squeeze(1).numpy()
+    # 縮放相機內參至 DA3 輸出解析度 W_proc, H_proc
+    scale_x = W_proc / W_orig
+    scale_y = H_proc / H_orig
+    cams_intrs_scaled = cams_intrs.copy()
+    cams_intrs_scaled[:, 0, :] *= scale_x
+    cams_intrs_scaled[:, 1, :] *= scale_y
 
     # 若為 surfel 模式，在 GPU 上計算各視角相機表面單位法向量 (OpenCV LINEMOD 最小差分標準)
     if args.voxel_mode == "surfel":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        d_raw_t = torch.from_numpy(depths_raw).unsqueeze(1).to(device)  # [V, 1, H_raw, W_raw]
-        _, _, H_raw, W_raw = d_raw_t.shape
-
-        intrs_raw = torch.from_numpy(cams_intrs).clone().float().to(device)
-        intrs_raw[:, 0, :] *= (float(W_raw) / float(W_orig))
-        intrs_raw[:, 1, :] *= (float(H_raw) / float(H_orig))
+        d_raw_t = torch.from_numpy(depths).unsqueeze(1).to(device)  # [V, 1, H_proc, W_proc]
+        intrs_raw = torch.from_numpy(cams_intrs_scaled).clone().float().to(device)
 
         with torch.no_grad():
             normals_raw, _ = depth_to_surface_normals(
@@ -403,24 +366,18 @@ def main():
                 intrinsics=intrs_raw,
                 method="min_gradient"
             )
-            normals_target = F.interpolate(
-                normals_raw,
-                size=(TARGET_H, TARGET_W),
-                mode="bilinear",
-                align_corners=False
-            )
-            normals_target = F.normalize(normals_target, dim=1, eps=1e-6)
-            normals_np = normals_target.permute(0, 2, 3, 1).cpu().numpy()  # [V, TARGET_H, TARGET_W, 3]
+            normals_target = F.normalize(normals_raw, dim=1, eps=1e-6)
+            normals_np = normals_target.permute(0, 2, 3, 1).cpu().numpy()  # [V, H_proc, W_proc, 3]
     else:
         normals_np = None
 
     # 3. 提取 2D 特徵並執行跨視角全域尺度校準 (Cross-View Global Scaling)
-    print("\n🔍 正在計算多視角 2D 特徵 (Noise Coring + 跨視角 Q_global 校準)...")
+    print(f"\n🔍 正在計算多視角 2D 特徵 ({W_proc}x{H_proc}, Noise Coring + 跨視角 Q_global 校準)...")
     scorer = RGBTextureScorer(normalize=False)
 
     raw_sobels, raw_dcts, raw_chromas, rgb_imgs = [], [], [], []
     for img_p in frame_img_paths:
-        img_pil = Image.open(img_p).convert("RGB").resize((TARGET_W, TARGET_H), Image.Resampling.BILINEAR)
+        img_pil = Image.open(img_p).convert("RGB").resize((W_proc, H_proc), Image.Resampling.BILINEAR)
         img_np = np.array(img_pil, dtype=np.uint8)
         rgb_imgs.append(img_np)
         img_t = torch.from_numpy(img_np).permute(2, 0, 1).float().unsqueeze(0) / 255.0
@@ -460,6 +417,8 @@ def main():
     for i in range(len(selected_cams)):
         norm_c_v = normals_np[i] if normals_np is not None else None
         valid_mask_i = (depths[i] > 0.1) & (depths[i] < 150.0) & np.isfinite(depths[i])
+        if args.conf_filter_mode == "2d":
+            valid_mask_i = valid_mask_i & (confs[i] >= args.conf_thresh)
 
         res_unproj = unproject_camera_points_with_features(
             rgb=rgb_imgs[i],
@@ -540,15 +499,23 @@ def main():
     feats_col = np.zeros((len(colmap_pts), 3), dtype=np.float32)
     confs_col = np.full(len(colmap_pts), 20.0, dtype=np.float32)
 
-    # 合併 DA3 與 COLMAP 點雲進入體素化
-    pts_merged = np.concatenate([pts_cat, colmap_pts], axis=0)
-    colors_merged = np.concatenate([colors_cat, pts_col_normed], axis=0)
-    feats_merged = np.concatenate([feats_cat, feats_col], axis=0)
-    footprints_merged = np.concatenate([footprints_cat, footprints_col], axis=0) if footprints_cat is not None else None
-    norms_merged = np.concatenate([norms_cat, norms_col], axis=0) if norms_cat is not None else None
-    confs_merged = np.concatenate([confs_cat, confs_col], axis=0)
-
-    print(f"   總輸入體素化點數 (DA3 + COLMAP): {len(pts_merged):,}")
+    if args.colmap_strategy == "decoupled":
+        pts_merged = pts_cat
+        colors_merged = colors_cat
+        feats_merged = feats_cat
+        footprints_merged = footprints_cat
+        norms_merged = norms_cat
+        confs_merged = confs_cat
+        print(f"   純淨 DA3 輸入體素化點數 (COLMAP 獨立解耦): {len(pts_merged):,}")
+    else:
+        # 合併 DA3 與 COLMAP 點雲進入體素化
+        pts_merged = np.concatenate([pts_cat, colmap_pts], axis=0)
+        colors_merged = np.concatenate([colors_cat, pts_col_normed], axis=0)
+        feats_merged = np.concatenate([feats_cat, feats_col], axis=0)
+        footprints_merged = np.concatenate([footprints_cat, footprints_col], axis=0) if footprints_cat is not None else None
+        norms_merged = np.concatenate([norms_cat, norms_col], axis=0) if norms_cat is not None else None
+        confs_merged = np.concatenate([confs_cat, confs_col], axis=0)
+        print(f"   總輸入體素化點數 (DA3 + COLMAP): {len(pts_merged):,}")
 
     # 5. 體素化特徵聚合 (Max-Pooling) 與信心度融合
     if args.voxel_mode == "surfel":
@@ -646,50 +613,13 @@ def main():
     p_chroma = s_chroma_v / max(np.sum(s_chroma_v), 1e-12)
     p_colmap = s_colmap_v / max(np.sum(s_colmap_v), 1e-12)
 
-    # 9. 凸優化求解最佳五項權重 [w0*, w_sobel*, w_dct*, w_chroma*, w_colmap*]
-    print("\n⚡ 執行 SLSQP 凸優化求解 5 項最佳特徵組合權重...")
+    # 9. 凸優化求解最佳特徵組合權重
     eps = 1e-12
 
     def kl_divergence(p: np.ndarray, q: np.ndarray) -> float:
         valid = (p > 0)
         return float(np.sum(p[valid] * np.log(p[valid] / (q[valid] + eps))))
 
-    def objective(w: np.ndarray) -> float:
-        p_pred = (
-            w[0] * p_base +
-            w[1] * p_sobel +
-            w[2] * p_dct +
-            w[3] * p_chroma +
-            w[4] * p_colmap
-        )
-        return kl_divergence(p_ideal, p_pred)
-
-    bounds = [(0.0, 1.0)] * 5
-    constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
-    init_w = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
-
-    opt_res = minimize(objective, init_w, method='SLSQP', bounds=bounds, constraints=constraints)
-    w_opt = opt_res.x
-    w_opt = np.clip(w_opt, 0.0, 1.0)
-    w_opt = w_opt / np.sum(w_opt)
-
-    p_opt = (
-        w_opt[0] * p_base +
-        w_opt[1] * p_sobel +
-        w_opt[2] * p_dct +
-        w_opt[3] * p_chroma +
-        w_opt[4] * p_colmap
-    )
-
-    # 10. 計算單項與綜合指標
-    kl_base = kl_divergence(p_ideal, p_base)
-    kl_sobel = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_sobel)
-    kl_dct = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_dct)
-    kl_chroma = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_chroma)
-    kl_colmap = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_colmap)
-    kl_opt = kl_divergence(p_ideal, p_opt)
-
-    # Top-K% 高斯捕捉率 (Recall)
     def calc_recall(p_score: np.ndarray, percentiles=[0.10, 0.20, 0.30, 0.50]):
         sort_idx = np.argsort(-p_score)
         recalls = {}
@@ -698,40 +628,205 @@ def main():
             recalls[f"top_{int(pct*100)}%"] = float(np.sum(p_ideal[sort_idx[:k]]))
         return recalls
 
-    recall_base = calc_recall(p_base)
-    recall_opt = calc_recall(p_opt)
-    recall_sobel = calc_recall(p_sobel)
-    recall_dct = calc_recall(p_dct)
-    recall_chroma = calc_recall(p_chroma)
-    recall_colmap = calc_recall(p_colmap)
+    if args.colmap_strategy == "decoupled":
+        print("\n⚡ 執行 SLSQP 凸優化求解 4 項最佳特徵組合權重 (COLMAP 作為解耦固定錨點)...")
 
-    print("\n" + "=" * 70)
-    print(" 評估結果摘要 (5 項特徵 SLSQP 優化)")
-    print("=" * 70)
-    print(f"最佳權重求解結果:")
-    print(f"  w0*       (平滑底色基準)   : {w_opt[0]:.4f}")
-    print(f"  w_sobel*  (S_sobel 邊界)   : {w_opt[1]:.4f}")
-    print(f"  w_dct*    (S_dct 材質紋理) : {w_opt[2]:.4f}")
-    print(f"  w_chroma* (S_chroma 色彩)  : {w_opt[3]:.4f}")
-    print(f"  w_colmap* (S_colmap 稀疏點): {w_opt[4]:.4f}")
-    print("-" * 70)
-    print(f"KL 散度 (越小代表越吻合 3DGS 高斯分佈):")
-    print(f"  Uniform Base (無先驗平滑) : {kl_base:.4f}")
-    print(f"  S_sobel 單項 (含 5% 底分) : {kl_sobel:.4f}")
-    print(f"  S_dct   單項 (含 5% 底分) : {kl_dct:.4f}")
-    print(f"  S_chroma單項 (含 5% 底分) : {kl_chroma:.4f}")
-    print(f"  S_colmap單項 (含 5% 底分) : {kl_colmap:.4f}")
-    print(f"  最佳 5 項組合 (Optimal)   : {kl_opt:.4f} (相比均勻基準降低: {kl_base - kl_opt:.4f})")
-    print("-" * 70)
-    print(f"Top-K% 體素高斯捕捉率 (Gaussian Capture Recall):")
-    print(f"  指標              | Top 10% | Top 20% | Top 30% | Top 50%")
-    print(f"  均勻隨機 (Base)   | {recall_base['top_10%']*100:6.2f}% | {recall_base['top_20%']*100:6.2f}% | {recall_base['top_30%']*100:6.2f}% | {recall_base['top_50%']*100:6.2f}%")
-    print(f"  S_sobel 邊界      | {recall_sobel['top_10%']*100:6.2f}% | {recall_sobel['top_20%']*100:6.2f}% | {recall_sobel['top_30%']*100:6.2f}% | {recall_sobel['top_50%']*100:6.2f}%")
-    print(f"  S_dct 材質        | {recall_dct['top_10%']*100:6.2f}% | {recall_dct['top_20%']*100:6.2f}% | {recall_dct['top_30%']*100:6.2f}% | {recall_dct['top_50%']*100:6.2f}%")
-    print(f"  S_chroma 色彩     | {recall_chroma['top_10%']*100:6.2f}% | {recall_chroma['top_20%']*100:6.2f}% | {recall_chroma['top_30%']*100:6.2f}% | {recall_chroma['top_50%']*100:6.2f}%")
-    print(f"  S_colmap 稀疏點   | {recall_colmap['top_10%']*100:6.2f}% | {recall_colmap['top_20%']*100:6.2f}% | {recall_colmap['top_30%']*100:6.2f}% | {recall_colmap['top_50%']*100:6.2f}%")
-    print(f"  最佳綜合 (Optimal)| {recall_opt['top_10%']*100:6.2f}% | {recall_opt['top_20%']*100:6.2f}% | {recall_opt['top_30%']*100:6.2f}% | {recall_opt['top_50%']*100:6.2f}%")
-    print("=" * 70)
+        def objective(w: np.ndarray) -> float:
+            p_pred = (
+                w[0] * p_base +
+                w[1] * p_sobel +
+                w[2] * p_dct +
+                w[3] * p_chroma
+            )
+            return kl_divergence(p_ideal, p_pred)
+
+        bounds = [(0.0, 1.0)] * 4
+        constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
+        init_w = np.array([0.25, 0.25, 0.25, 0.25])
+
+        opt_res = minimize(objective, init_w, method='SLSQP', bounds=bounds, constraints=constraints)
+        w_opt = opt_res.x
+        w_opt = np.clip(w_opt, 0.0, 1.0)
+        w_opt = w_opt / np.sum(w_opt)
+
+        p_opt = (
+            w_opt[0] * p_base +
+            w_opt[1] * p_sobel +
+            w_opt[2] * p_dct +
+            w_opt[3] * p_chroma
+        )
+
+        kl_base = kl_divergence(p_ideal, p_base)
+        kl_sobel = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_sobel)
+        kl_dct = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_dct)
+        kl_chroma = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_chroma)
+        kl_opt = kl_divergence(p_ideal, p_opt)
+
+        recall_base = calc_recall(p_base)
+        recall_opt = calc_recall(p_opt)
+        recall_sobel = calc_recall(p_sobel)
+        recall_dct = calc_recall(p_dct)
+        recall_chroma = calc_recall(p_chroma)
+
+        print("\n" + "=" * 70)
+        print(" 評估結果摘要 (4 項特徵 SLSQP 優化 - COLMAP 解耦固定錨點)")
+        print("=" * 70)
+        print(f"最佳權重求解結果:")
+        print(f"  w0*       (平滑底色基準)   : {w_opt[0]:.4f}")
+        print(f"  w_sobel*  (S_sobel 邊界)   : {w_opt[1]:.4f}")
+        print(f"  w_dct*    (S_dct 材質紋理) : {w_opt[2]:.4f}")
+        print(f"  w_chroma* (S_chroma 色彩)  : {w_opt[3]:.4f}")
+        print("-" * 70)
+        print(f"KL 散度 (越小代表越吻合 3DGS 高斯分佈):")
+        print(f"  Uniform Base : {kl_base:.4f}")
+        print(f"  S_sobel 單項 : {kl_sobel:.4f}")
+        print(f"  S_dct   單項 : {kl_dct:.4f}")
+        print(f"  S_chroma單項 : {kl_chroma:.4f}")
+        print(f"  最佳 4 項組合: {kl_opt:.4f} (相比均勻基準降低: {kl_base - kl_opt:.4f})")
+        print("-" * 70)
+        print(f"Top-K% 體素高斯捕捉率 (Gaussian Capture Recall):")
+        print(f"  指標              | Top 10% | Top 20% | Top 30% | Top 50%")
+        print(f"  均勻隨機 (Base)   | {recall_base['top_10%']*100:6.2f}% | {recall_base['top_20%']*100:6.2f}% | {recall_base['top_30%']*100:6.2f}% | {recall_base['top_50%']*100:6.2f}%")
+        print(f"  S_sobel 邊界      | {recall_sobel['top_10%']*100:6.2f}% | {recall_sobel['top_20%']*100:6.2f}% | {recall_sobel['top_30%']*100:6.2f}% | {recall_sobel['top_50%']*100:6.2f}%")
+        print(f"  S_dct 材質        | {recall_dct['top_10%']*100:6.2f}% | {recall_dct['top_20%']*100:6.2f}% | {recall_dct['top_30%']*100:6.2f}% | {recall_dct['top_50%']*100:6.2f}%")
+        print(f"  S_chroma 色彩     | {recall_chroma['top_10%']*100:6.2f}% | {recall_chroma['top_20%']*100:6.2f}% | {recall_chroma['top_30%']*100:6.2f}% | {recall_chroma['top_50%']*100:6.2f}%")
+        print(f"  最佳 4 項組合     | {recall_opt['top_10%']*100:6.2f}% | {recall_opt['top_20%']*100:6.2f}% | {recall_opt['top_30%']*100:6.2f}% | {recall_opt['top_50%']*100:6.2f}%")
+        print("=" * 70)
+
+        opt_weights_dict = {
+            "w_0": float(w_opt[0]),
+            "w_sobel": float(w_opt[1]),
+            "w_dct": float(w_opt[2]),
+            "w_chroma": float(w_opt[3]),
+        }
+        kl_dict = {
+            "uniform_base": float(kl_base),
+            "sobel_alone": float(kl_sobel),
+            "dct_alone": float(kl_dct),
+            "chroma_alone": float(kl_chroma),
+            "optimal": float(kl_opt)
+        }
+        recall_dict = {
+            "uniform_base": recall_base,
+            "sobel_alone": recall_sobel,
+            "dct_alone": recall_dct,
+            "chroma_alone": recall_chroma,
+            "optimal": recall_opt
+        }
+
+        # 僅當明確指定 --output_ply 時才匯出點雲 (預設僅求解權重 JSON)
+        if args.output_ply:
+            target_total = args.target_budget if args.target_budget > 0 else 50000
+            num_colmap = len(colmap_pts)
+            needed_da3 = max(0, target_total - num_colmap)
+            p_torch = torch.from_numpy(p_opt).float()
+            torch.manual_seed(42)
+            np.random.seed(42)
+            sampled_da3_idx = torch.multinomial(p_torch, num_samples=min(needed_da3, num_voxels), replacement=False).numpy()
+            da3_sampled_pts = v_pts[sampled_da3_idx]
+            da3_sampled_cols = (np.clip(v_cols[sampled_da3_idx], 0.0, 1.0) * 255).astype(np.uint8) if v_cols.max() <= 1.0 else v_cols[sampled_da3_idx].astype(np.uint8)
+            colmap_cols_u8 = (np.clip(colmap_cols, 0.0, 1.0) * 255).astype(np.uint8) if colmap_cols.max() <= 1.0 else colmap_cols.astype(np.uint8)
+            final_pts = np.concatenate([colmap_pts, da3_sampled_pts], axis=0)
+            final_cols = np.concatenate([colmap_cols_u8, da3_sampled_cols], axis=0)
+
+            dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'), ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+            el_data = np.empty(len(final_pts), dtype=dtype)
+            el_data['x'] = final_pts[:, 0]
+            el_data['y'] = final_pts[:, 1]
+            el_data['z'] = final_pts[:, 2]
+            el_data['red'] = final_cols[:, 0]
+            el_data['green'] = final_cols[:, 1]
+            el_data['blue'] = final_cols[:, 2]
+            os.makedirs(os.path.dirname(os.path.abspath(args.output_ply)), exist_ok=True)
+            plyfile.PlyData([plyfile.PlyElement.describe(el_data, 'vertex')], text=False).write(args.output_ply)
+            print(f"💾 已匯出最終解耦點雲: {args.output_ply} ({len(final_pts):,} 點: {num_colmap} COLMAP + {len(da3_sampled_pts)} DA3)")
+
+    else:
+        print("\n⚡ 執行 SLSQP 凸優化求解 5 項最佳特徵組合權重...")
+
+        def objective(w: np.ndarray) -> float:
+            p_pred = (
+                w[0] * p_base +
+                w[1] * p_sobel +
+                w[2] * p_dct +
+                w[3] * p_chroma +
+                w[4] * p_colmap
+            )
+            return kl_divergence(p_ideal, p_pred)
+
+        bounds = [(0.0, 1.0)] * 5
+        constraints = [{'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0}]
+        init_w = np.array([0.2, 0.2, 0.2, 0.2, 0.2])
+
+        opt_res = minimize(objective, init_w, method='SLSQP', bounds=bounds, constraints=constraints)
+        w_opt = opt_res.x
+        w_opt = np.clip(w_opt, 0.0, 1.0)
+        w_opt = w_opt / np.sum(w_opt)
+
+        p_opt = (
+            w_opt[0] * p_base +
+            w_opt[1] * p_sobel +
+            w_opt[2] * p_dct +
+            w_opt[3] * p_chroma +
+            w_opt[4] * p_colmap
+        )
+
+        kl_base = kl_divergence(p_ideal, p_base)
+        kl_sobel = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_sobel)
+        kl_dct = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_dct)
+        kl_chroma = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_chroma)
+        kl_colmap = kl_divergence(p_ideal, 0.05 * p_base + 0.95 * p_colmap)
+        kl_opt = kl_divergence(p_ideal, p_opt)
+
+        recall_base = calc_recall(p_base)
+        recall_opt = calc_recall(p_opt)
+        recall_sobel = calc_recall(p_sobel)
+        recall_dct = calc_recall(p_dct)
+        recall_chroma = calc_recall(p_chroma)
+        recall_colmap = calc_recall(p_colmap)
+
+        print("\n" + "=" * 70)
+        print(" 評估結果摘要 (5 項特徵 SLSQP 優化)")
+        print("=" * 70)
+        print(f"最佳權重求解結果:")
+        print(f"  w0*       (平滑底色基準)   : {w_opt[0]:.4f}")
+        print(f"  w_sobel*  (S_sobel 邊界)   : {w_opt[1]:.4f}")
+        print(f"  w_dct*    (S_dct 材質紋理) : {w_opt[2]:.4f}")
+        print(f"  w_chroma* (S_chroma 色彩)  : {w_opt[3]:.4f}")
+        print(f"  w_colmap* (S_colmap 稀疏點): {w_opt[4]:.4f}")
+        print("-" * 70)
+        print(f"KL 散度 (越小代表越吻合 3DGS 高斯分佈):")
+        print(f"  Uniform Base : {kl_base:.4f}")
+        print(f"  S_sobel 單項 : {kl_sobel:.4f}")
+        print(f"  S_dct   單項 : {kl_dct:.4f}")
+        print(f"  S_chroma單項 : {kl_chroma:.4f}")
+        print(f"  S_colmap單項 : {kl_colmap:.4f}")
+        print(f"  最佳 5 項組合: {kl_opt:.4f} (相比均勻基準降低: {kl_base - kl_opt:.4f})")
+        print("-" * 70)
+
+        opt_weights_dict = {
+            "w_0": float(w_opt[0]),
+            "w_sobel": float(w_opt[1]),
+            "w_dct": float(w_opt[2]),
+            "w_chroma": float(w_opt[3]),
+            "w_colmap": float(w_opt[4])
+        }
+        kl_dict = {
+            "uniform_base": float(kl_base),
+            "sobel_alone": float(kl_sobel),
+            "dct_alone": float(kl_dct),
+            "chroma_alone": float(kl_chroma),
+            "colmap_alone": float(kl_colmap),
+            "optimal": float(kl_opt)
+        }
+        recall_dict = {
+            "uniform_base": recall_base,
+            "sobel_alone": recall_sobel,
+            "dct_alone": recall_dct,
+            "chroma_alone": recall_chroma,
+            "colmap_alone": recall_colmap,
+            "optimal": recall_opt
+        }
 
     # 11. 匯出結果至 JSON
     output_dict = {
@@ -745,9 +840,13 @@ def main():
         "min_voxel_size": args.min_voxel_size,
         "dynamic_voxel_scale": args.dynamic_voxel_scale,
         "conf_thresh": args.conf_thresh,
+        "conf_filter_mode": args.conf_filter_mode,
+        "colmap_strategy": "decoupled_fixed_anchors" if args.colmap_strategy == "decoupled" else "coupled",
         "colmap_path": args.colmap_path,
         "da3_model": args.da3_model,
         "process_res": args.process_res,
+        "target_w": int(W_proc),
+        "target_h": int(H_proc),
         "num_voxels": int(num_voxels),
         "num_gt_gaussians": int(num_gt),
         "matched_gt_gaussians": int(np.sum(valid_gt_mask)),
@@ -758,29 +857,9 @@ def main():
             "s_dct": float(q_dct),
             "s_chroma": float(q_chroma)
         },
-        "optimal_weights": {
-            "w_0": float(w_opt[0]),
-            "w_sobel": float(w_opt[1]),
-            "w_dct": float(w_opt[2]),
-            "w_chroma": float(w_opt[3]),
-            "w_colmap": float(w_opt[4])
-        },
-        "kl_divergence": {
-            "uniform_base": float(kl_base),
-            "sobel_alone": float(kl_sobel),
-            "dct_alone": float(kl_dct),
-            "chroma_alone": float(kl_chroma),
-            "colmap_alone": float(kl_colmap),
-            "optimal": float(kl_opt)
-        },
-        "recall": {
-            "uniform_base": recall_base,
-            "sobel_alone": recall_sobel,
-            "dct_alone": recall_dct,
-            "chroma_alone": recall_chroma,
-            "colmap_alone": recall_colmap,
-            "optimal": recall_opt
-        }
+        "optimal_weights": opt_weights_dict,
+        "kl_divergence": kl_dict,
+        "recall": recall_dict
     }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
