@@ -30,3 +30,5 @@ pointcloud_benchmark*
 *.csv
 *.json
 !package*.json
+_probe_out/
+*conf_vis*.png

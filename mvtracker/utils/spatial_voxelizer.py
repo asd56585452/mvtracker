@@ -24,6 +24,7 @@ def _voxel_downsample_gpu(
     scale: float = 1.0,
     confidences: Optional[torch.Tensor] = None,
     conf_agg: str = "min",
+    return_dyn_ratio: bool = False,
     device: torch.device = torch.device("cuda"),
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """PyTorch GPU 向量化體素下採樣與特徵 Max-Pooling (支援均勻與動態足跡體素化，及信心度 min/mean 融合)。"""
@@ -72,9 +73,9 @@ def _voxel_downsample_gpu(
             feats_v = None
 
         if has_dynamic:
-            dyn_v = torch.zeros(M, dtype=torch.long, device=dev).scatter_reduce_(
-                0, inv, is_dynamic.long(), reduce="amax", include_self=False
-            ).bool()
+            dyn_sum = torch.zeros(M, device=dev).scatter_add_(0, inv, is_dynamic.float())
+            dyn_ratio = dyn_sum / counts.squeeze(1)
+            dyn_v = dyn_ratio if return_dyn_ratio else (dyn_ratio > 0)
         else:
             dyn_v = None
 
@@ -208,6 +209,7 @@ def _surfel_downsample_gpu(
     surfel_angle_deg: float = 25.0,
     confidences: Optional[torch.Tensor] = None,
     conf_agg: str = "min",
+    return_dyn_ratio: bool = False,
     device: torch.device = torch.device("cuda"),
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
@@ -321,9 +323,9 @@ def _surfel_downsample_gpu(
             feat_v = None
 
         if has_dynamic:
-            dyn_v = torch.zeros(M, dtype=torch.long, device=dev).scatter_reduce_(
-                0, inv, dyn_sub.long(), reduce="amax", include_self=False
-            ).bool()
+            dyn_sum = torch.zeros(M, device=dev).scatter_add_(0, inv, dyn_sub.float())
+            dyn_ratio = dyn_sum / counts.squeeze(1)
+            dyn_v = dyn_ratio if return_dyn_ratio else (dyn_ratio > 0)
         else:
             dyn_v = None
 
@@ -439,9 +441,9 @@ def _surfel_downsample_gpu(
                 feats_final = None
 
             if has_dynamic:
-                dyn_final = torch.zeros(M_final, dtype=torch.long, device=dev).scatter_reduce_(
-                    0, inv_cluster, dyn_v.long(), reduce="amax", include_self=False
-                ).bool()
+                dyn_sum = torch.zeros(M_final, device=dev).scatter_add_(0, inv_cluster, dyn_v.float())
+                dyn_ratio = dyn_sum / cluster_counts.squeeze(1)
+                dyn_final = dyn_ratio if return_dyn_ratio else (dyn_ratio > 0)
             else:
                 dyn_final = None
 
@@ -502,6 +504,7 @@ def voxel_downsample_unified_with_features(
     confidences: Optional[Union[np.ndarray, torch.Tensor]] = None,
     conf_agg: str = "min",
     return_confidences: bool = False,
+    return_dyn_ratio: bool = False,
     device: Optional[Union[str, torch.device]] = None,
 ) -> Union[
     Tuple[Union[np.ndarray, torch.Tensor], Union[np.ndarray, torch.Tensor], Optional[Union[np.ndarray, torch.Tensor]], Optional[Union[np.ndarray, torch.Tensor]]],
@@ -591,6 +594,7 @@ def voxel_downsample_unified_with_features(
                 surfel_angle_deg=surfel_angle_deg,
                 confidences=conf_t,
                 conf_agg=conf_agg,
+                return_dyn_ratio=return_dyn_ratio,
                 device=target_device,
             )
         else:
@@ -606,6 +610,7 @@ def voxel_downsample_unified_with_features(
                 scale=scale,
                 confidences=conf_t,
                 conf_agg=conf_agg,
+                return_dyn_ratio=return_dyn_ratio,
                 device=target_device,
             )
 
@@ -868,7 +873,10 @@ def unproject_camera_points_with_features(
         cols = cols / 255.0
 
     # 特徵向量 [N, D]
-    feats = features[mask].astype(np.float32)
+    if features is not None:
+        feats = features[mask].astype(np.float32)
+    else:
+        feats = np.zeros((len(x), 1), dtype=np.float32)
 
     # 3D 足跡 footprint = depth / focal
     footprints = (z / focal).astype(np.float32)
