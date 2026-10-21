@@ -23,8 +23,7 @@ env UID=$(id -u) GID=$(id -g) docker compose run --rm mvtracker \
     --frame_step 1 \
     --da3_model depth-anything/DA3-GIANT-1.1 \
     --conf_thresh 5.0 \
-    --no_rrd \
-    --skip_existing
+    --no_rrd
 
 echo "=============================================================================="
 echo "🎉 全 6 場景 300 幀 GOF 分段產出與耗時統計全部完成！"

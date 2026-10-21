@@ -518,7 +518,8 @@ def main():
     p.add_argument("--colmap_dyn_budget", type=int, default=800, help="每影格 COLMAP 動態錨點抽樣預算 (預設 800，<=0 則不抽樣)")
     p.add_argument("--da3_dyn_budget", type=int, default=800, help="每影格 DA3 動態 Surfel 抽樣預算 (預設 800，<=0 則不抽樣)")
     p.add_argument("--dyn_budget_per_frame", type=int, default=0, help="可選: 每影格總動態點數上限 (若 > 0 且未個別設定，則 COLMAP 與 DA3 各半)")
-    p.add_argument("--mask_views", type=str, default="all", choices=["all", "selected"], help="2D 動態遮罩計算視角範圍: all (全21視角，預設) 或 selected (僅 5 主視角)")
+    p.add_argument("--mask_views", type=str, default="all", choices=["all", "selected"], help="2D 動態遮罩計算視角範圍: all (全訓練視角，預設) 或 selected (僅 5 主視角)")
+    p.add_argument("--test_cam_idx", type=int, default=0, help="排除之測試視角索引 (預設 0 即 cam00，嚴格杜絕測試集資訊外洩)")
     p.add_argument("--da3_model", type=str, default="depth-anything/DA3-GIANT-1.1", help="DA3 模型版本 (預設 depth-anything/DA3-GIANT-1.1)")
     p.add_argument("--process_res", type=int, default=728, help="DA3 原生推論解析度 (預設 728)")
     p.add_argument("--conf_thresh", type=float, default=5.0, help="DA3 2D 信心度門檻 (預設 5.0)")
@@ -565,9 +566,10 @@ def main():
     all_w2c_np = np.stack([x[0] for x in all_w2c_K])
     all_intrs_np = np.stack([x[1] for x in all_w2c_K])
 
-    # 2. FPS 挑選 5 個最佳訓練相機 (排除 cam00 測試視角，嚴守紅線 1)
-    selected_cams = select_cams_by_fps(all_w2c_np, num_to_select=args.num_cams, alpha=0.8, exclude_indices=[0])
-    print(f"🎯 [相機挑選] FPS 選取 5 個主視角相機: {selected_cams} (已排除測試視角 0)")
+    # 2. FPS 挑選 5 個最佳訓練相機 (嚴格排除測試視角 cam00，嚴守基準測試紅線)
+    exclude_cams = [args.test_cam_idx] if args.test_cam_idx >= 0 else []
+    selected_cams = select_cams_by_fps(all_w2c_np, num_to_select=args.num_cams, alpha=0.8, exclude_indices=exclude_cams)
+    print(f"🎯 [相機挑選] FPS 選取 5 個主視角相機: {selected_cams} (已排除測試視角: {exclude_cams})")
 
     # 準備 5 主相機檔案清單與幾何矩陣
     cam_file_lists = []
@@ -587,13 +589,13 @@ def main():
     extr_4x4[:, 3, 3] = 1.0
     intr_orig_arr = np.stack(cam_intr_5)
 
-    # 3. 在全視角或主視角上計算 GOF 全時段累積 2D 動態掩碼 (Temporal Union)
+    # 3. 在全訓練視角或主視角上計算 GOF 全時段累積 2D 動態掩碼 (Temporal Union)
     if args.mask_views == "all":
-        mask_cams = list(range(num_views))
-        print(f"🌟 [全視角升級] 使用全部 {len(mask_cams)} 個相機視角計算 2D 動態 Mask，確保 100% COLMAP 錨點原生 SIFT 查表！")
+        mask_cams = [i for i in range(num_views) if i not in exclude_cams]
+        print(f"🌟 [全視角升級] 使用全部 {len(mask_cams)} 個訓練視角計算 2D 動態 Mask (嚴守紅線：已排除測試視角 {exclude_cams})，確保 100% 訓練相機原生 SIFT 查表且無測試資料外洩！")
     else:
         mask_cams = selected_cams
-        print(f"🎯 使用挑選之 {len(mask_cams)} 個相機視角計算 2D 動態 Mask")
+        print(f"🎯 使用挑選之 {len(mask_cams)} 個相機視角計算 2D 動態 Mask (已排除測試視角 {exclude_cams})")
 
     gof_dyn_masks = compute_gof_2d_dynamic_masks(
         view_dirs=view_dirs,

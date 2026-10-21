@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--rrd_first_gof_only", action="store_true", default=True, help="僅第 1 個 GOF 輸出 .rrd 視覺化檔，其餘使用 --no_rrd 提速")
     parser.add_argument("--all_rrd", action="store_true", help="若指定，則所有 GOF 都輸出 .rrd 檔")
     parser.add_argument("--no_rrd", action="store_true", help="關閉所有 GOF 的 Rerun 記錄以最高速度產出點雲")
+    parser.add_argument("--test_cam_idx", type=int, default=0, help="排除之測試視角索引 (預設 0 即 cam00)")
     parser.add_argument("--skip_existing", action="store_true", help="若該 GOF 區塊已存在產出則跳過")
     args = parser.parse_args()
 
@@ -93,6 +94,7 @@ def main():
                 "--frame_step", str(args.frame_step),
                 "--da3_model", args.da3_model,
                 "--conf_thresh", str(args.conf_thresh),
+                "--test_cam_idx", str(args.test_cam_idx),
                 "--export_ply", out_ply,
             ]
             if need_rrd:

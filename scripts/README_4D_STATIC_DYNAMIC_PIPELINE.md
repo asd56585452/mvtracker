@@ -178,6 +178,8 @@ datasets/<scene>/
 >    - 必須透過 `compute_adaptive_radii` 給予遠景錨點距離補償，否則遠景在 Rerun 中會縮小至次像素而消失。
 > 5. **批次執行全量 300 幀時務必啟用 `--no_rrd`**：
 >    - 每個 GOF 的 `.rrd` 檔案超過 100MB，全場景全區塊產出將消耗數十 GB 硬碟空間並拖慢 30% 以上速度。
+> 6. **絕對不可將測試視角（cam00）納入 2D 動態 Mask 計算或 DA3 重建（嚴防 Data Leakage）**：
+>    - N3D / CSTG 評估協定中 `cam00` 是 Held-out 測試視角。若納入 RAFT 光流或顏色差分計算，會使測試集資訊洩漏至訓練初始化點雲中。管線預設 `--test_cam_idx 0` 嚴格隔離。
 
 ---
 
